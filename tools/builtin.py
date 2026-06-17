@@ -1,8 +1,8 @@
 from typing import Any, Dict
 from datetime import datetime
 
-from ..mcp.registry import ToolRegistry
-from ..mcp.types import ToolSpec
+from ..runtime.registry import ToolRegistry
+from ..runtime.types import ToolDefinition
 
 
 def time_now(args: Dict[str, Any]) -> str:
@@ -33,7 +33,7 @@ def time_now(args: Dict[str, Any]) -> str:
 
 def register(registry: ToolRegistry) -> int:
     """注册内置零依赖工具集，当前仅包含 time.now"""
-    spec = ToolSpec(
+    spec = ToolDefinition(
         name="time.now",
         description="获取当前时间并按给定格式输出。用于需要日志/时间戳或人类可读时间时。返回字符串（与 output_schema 一致），默认使用系统时区，可指定 IANA 时区。",
         input_schema={
@@ -60,6 +60,11 @@ def register(registry: ToolRegistry) -> int:
         ],
         available=True,
         tags=["builtin", "time"],
+        domain="admin",
+        risk="low",
+        exposure="hidden",
+        result_policy={"mode": "inline", "max_chars": 1000},
+        aliases=["time", "now", "当前时间"],
     )
     registry.register(spec, time_now)
     return 1

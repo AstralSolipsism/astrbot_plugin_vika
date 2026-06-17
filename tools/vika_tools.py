@@ -1,12 +1,14 @@
-import hashlib
+﻿import hashlib
 import json
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ..cache import CatalogCache
 from ..config import load_config
-from ..mcp.registry import ToolRegistry
-from ..mcp.types import ToolSpec
-from ..mcp.validation import ToolInputInvalid, validate_arguments
+from ..runtime.limits import enforce_inline_record_limit, normalize_query_page_size
+from ..runtime.registry import ToolRegistry
+from ..runtime.services import RuntimeServices
+from ..runtime.types import ToolDefinition
+from ..runtime.validation import ToolInputInvalid, validate_arguments
 
 try:
     from astral_vika import DEFAULT_API_BASE, Vika
@@ -24,15 +26,16 @@ except Exception:
 
 
 WRITE_TOOLS = {
-    "records.create",
-    "records.update",
-    "records.delete",
-    "fields.create",
-    "fields.delete",
-    "datasheets.create",
-    "attachments.upload",
-    "nodes.embedlinks.create",
-    "nodes.embedlinks.delete",
+    "vika.records.create",
+    "vika.records.update",
+    "vika.records.delete",
+    "vika.fields.create",
+    "vika.fields.delete",
+    "vika.datasheets.create",
+    "vika.attachments.upload",
+    "vika.nodes.embedlinks.create",
+    "vika.nodes.embedlinks.delete",
+    "vika.write.commit",
 }
 
 
@@ -736,55 +739,52 @@ def _raise_if_error(result: Any) -> Any:
     return result
 
 
-def _preview(operation: str, target: Dict[str, Any], payload: Any) -> Dict[str, Any]:
-    return {
-        "executed": False,
-        "preview_only": True,
-        "requires_confirmation": True,
-        "confirmation_fields": {"dry_run": False, "confirm": True},
-        "operation": operation,
-        "target": target,
-        "payload_preview": payload,
-        "message": "Preview only. No Vika write operation was executed.",
-    }
+def _record_count_from_payload(payload: Dict[str, Any]) -> int:
+    records = payload.get("records")
+    if isinstance(records, list):
+        return len(records)
+    if isinstance(records, dict):
+        return 1
+    record_ids = payload.get("record_ids")
+    if isinstance(record_ids, list):
+        return len(record_ids)
+    return 1
 
 
-async def _execute(operation: str, call: Any) -> Dict[str, Any]:
-    result = _raise_if_error(await call)
-    return {
-        "executed": True,
-        "preview_only": False,
-        "requires_confirmation": False,
-        "operation": operation,
-        "result": result,
-    }
+def _field_names_from_records(records: Any) -> List[str]:
+    if isinstance(records, dict):
+        records = [records]
+    names = set()
+    if isinstance(records, list):
+        for record in records:
+            if isinstance(record, dict):
+                fields = record.get("fields")
+                if isinstance(fields, dict):
+                    names.update(str(key) for key in fields.keys())
+    return sorted(names)
 
 
-def _should_execute(args: Dict[str, Any]) -> bool:
-    return args.get("dry_run") is False and args.get("confirm") is True
-
-
-async def vika_status(args: Dict[str, Any]) -> Any:
+async def vika_status(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.status())
 
 
-async def vika_healthcheck(args: Dict[str, Any]) -> Any:
+async def vika_healthcheck(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return await _CLIENT.healthcheck()
 
 
-async def vika_spaces_list(args: Dict[str, Any]) -> Any:
+async def vika_spaces_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.spaces_list(args.get("use_cache", True), args.get("force_refresh", False)))
 
 
-async def vika_nodes_list(args: Dict[str, Any]) -> Any:
+async def vika_nodes_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.nodes_list(args["space_id"], args.get("use_cache", True), args.get("force_refresh", False)))
 
 
-async def vika_nodes_search(args: Dict[str, Any]) -> Any:
+async def vika_nodes_search(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(
         await _CLIENT.nodes_search(
@@ -799,147 +799,302 @@ async def vika_nodes_search(args: Dict[str, Any]) -> Any:
     )
 
 
-async def vika_nodes_tree(args: Dict[str, Any]) -> Any:
+async def vika_nodes_tree(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.nodes_tree(args["space_id"], args.get("use_cache", True), args.get("force_refresh", False)))
 
 
-async def vika_nodes_get(args: Dict[str, Any]) -> Any:
+async def vika_nodes_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.nodes_get(args["space_id"], args["node_id"], args.get("use_cache", True)))
 
 
-async def vika_nodes_embedlinks_list(args: Dict[str, Any]) -> Any:
+async def vika_nodes_embedlinks_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.embedlinks_list(args["space_id"], args["node_id"]))
 
 
-async def vika_nodes_embedlinks_create(args: Dict[str, Any]) -> Any:
+async def vika_nodes_embedlinks_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    payload = {"theme": args.get("theme"), "payload": args.get("payload")}
-    if not _should_execute(args):
-        return _preview("nodes.embedlinks.create", {"space_id": args["space_id"], "node_id": args["node_id"]}, payload)
-    return await _execute("nodes.embedlinks.create", _CLIENT.embedlinks_create(args["space_id"], args["node_id"], args.get("theme"), args.get("payload")))
+    payload = {"space_id": args["space_id"], "node_id": args["node_id"], "theme": args.get("theme"), "payload": args.get("payload")}
+    return services.write_plans.preview(
+        "nodes.embedlinks.create",
+        args["node_id"],
+        args["node_id"],
+        payload,
+        [],
+        1,
+        lambda operation: _CLIENT.embedlinks_create(
+            operation["payload"]["space_id"],
+            operation["payload"]["node_id"],
+            operation["payload"].get("theme"),
+            operation["payload"].get("payload"),
+        ),
+    )
 
 
-async def vika_nodes_embedlinks_delete(args: Dict[str, Any]) -> Any:
+async def vika_nodes_embedlinks_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    if not _should_execute(args):
-        return _preview("nodes.embedlinks.delete", {"space_id": args["space_id"], "node_id": args["node_id"], "link_id": args["link_id"]}, {})
-    return await _execute("nodes.embedlinks.delete", _CLIENT.embedlinks_delete(args["space_id"], args["node_id"], args["link_id"]))
+    payload = {"space_id": args["space_id"], "node_id": args["node_id"], "link_id": args["link_id"]}
+    return services.write_plans.preview(
+        "nodes.embedlinks.delete",
+        args["node_id"],
+        args["node_id"],
+        payload,
+        [],
+        1,
+        lambda operation: _CLIENT.embedlinks_delete(
+            operation["payload"]["space_id"],
+            operation["payload"]["node_id"],
+            operation["payload"]["link_id"],
+        ),
+    )
 
 
-async def vika_catalog_refresh(args: Dict[str, Any]) -> Any:
+async def vika_catalog_refresh(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.catalog_refresh(args.get("space_id"), args.get("include_fields", False), args.get("include_views", False), args.get("force", False)))
 
 
-async def vika_catalog_status(args: Dict[str, Any]) -> Any:
+async def vika_catalog_status(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _CLIENT.catalog_status()
 
 
-async def vika_catalog_search(args: Dict[str, Any]) -> Any:
+async def vika_catalog_search(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _CLIENT.catalog_search(args.get("query", ""), args.get("space_id"), args.get("node_type"), args.get("limit", 20))
 
 
-async def vika_catalog_get(args: Dict[str, Any]) -> Any:
+async def vika_catalog_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _CLIENT.catalog_get(args["item_type"], args["item_id"])
 
 
-async def vika_catalog_clear(args: Dict[str, Any]) -> Any:
+async def vika_catalog_clear(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _CLIENT.catalog_clear(args.get("space_id"))
 
 
-async def vika_schema_get(args: Dict[str, Any]) -> Any:
+async def vika_schema_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.schema_get(args["datasheet_id"], args.get("space_id"), args.get("use_cache", True), args.get("force_refresh", False)))
 
 
-async def vika_records_query(args: Dict[str, Any]) -> Any:
+async def vika_records_query(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.records_query(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), args.get("page_size"), args.get("page_num"), args.get("page_token"), args.get("sort"), args.get("field_key")))
+    page_size = normalize_query_page_size(args.get("page_size"))
+    result = _raise_if_error(await _CLIENT.records_query(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), page_size, args.get("page_num"), args.get("page_token"), args.get("sort"), args.get("field_key")))
+    result.update(
+        {
+            "datasheet_id": args["datasheet_id"],
+            "view_id": args.get("view_id"),
+            "fields": args.get("fields"),
+            "formula": args.get("formula"),
+            "page_size": page_size,
+        }
+    )
+    return enforce_inline_record_limit(result)
 
 
-async def vika_records_read_all(args: Dict[str, Any]) -> Any:
+async def vika_records_read_all(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.records_read_all(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), args.get("page_size", 100), args.get("max_records"), args.get("max_pages"), args.get("sort"), args.get("field_key")))
 
 
-async def vika_records_create(args: Dict[str, Any]) -> Any:
+async def vika_export_records(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    payload = {"records": args["records"], "field_key": args.get("field_key")}
-    if not _should_execute(args):
-        return _preview("records.create", {"datasheet_id": args["datasheet_id"]}, payload)
-    return await _execute("records.create", _CLIENT.records_create(args["datasheet_id"], args["records"], args.get("field_key")))
+    result = _raise_if_error(
+        await _CLIENT.records_read_all(
+            args["datasheet_id"],
+            args.get("view_id"),
+            args.get("formula"),
+            args.get("fields"),
+            args.get("page_size", 100),
+            args.get("max_records"),
+            args.get("max_pages"),
+            args.get("sort"),
+            args.get("field_key"),
+        )
+    )
+    records = result.get("records", []) or []
+    field_names = args.get("fields") or sorted({key for record in records for key in (record.get("fields") or {}).keys()})
+    return services.artifact_store.create_records_export(
+        datasheet_id=args["datasheet_id"],
+        records=records,
+        field_names=field_names,
+        source_args=args,
+        view_id=args.get("view_id"),
+        query={"formula": args.get("formula"), "sort": args.get("sort")},
+        format=args.get("format") or "csv",
+    )
 
 
-async def vika_records_update(args: Dict[str, Any]) -> Any:
+async def vika_records_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    payload = {"records": args["records"], "field_key": args.get("field_key")}
-    if not _should_execute(args):
-        return _preview("records.update", {"datasheet_id": args["datasheet_id"]}, payload)
-    return await _execute("records.update", _CLIENT.records_update(args["datasheet_id"], args["records"], args.get("field_key")))
+    payload = {"datasheet_id": args["datasheet_id"], "records": args["records"], "field_key": args.get("field_key")}
+    return services.write_plans.preview(
+        "records.create",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        _field_names_from_records(payload["records"]),
+        _record_count_from_payload(payload),
+        lambda operation: _CLIENT.records_create(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["records"],
+            operation["payload"].get("field_key"),
+        ),
+    )
 
 
-async def vika_records_delete(args: Dict[str, Any]) -> Any:
+async def vika_records_update(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    if not _should_execute(args):
-        return _preview("records.delete", {"datasheet_id": args["datasheet_id"], "record_ids": args["record_ids"]}, {})
-    return await _execute("records.delete", _CLIENT.records_delete(args["datasheet_id"], args["record_ids"]))
+    payload = {"datasheet_id": args["datasheet_id"], "records": args["records"], "field_key": args.get("field_key")}
+    return services.write_plans.preview(
+        "records.update",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        _field_names_from_records(payload["records"]),
+        _record_count_from_payload(payload),
+        lambda operation: _CLIENT.records_update(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["records"],
+            operation["payload"].get("field_key"),
+        ),
+    )
 
 
-async def vika_records_get(args: Dict[str, Any]) -> Any:
+async def vika_records_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
+    assert _CLIENT is not None
+    payload = {"datasheet_id": args["datasheet_id"], "record_ids": args["record_ids"]}
+    return services.write_plans.preview(
+        "records.delete",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        [],
+        _record_count_from_payload(payload),
+        lambda operation: _CLIENT.records_delete(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["record_ids"],
+        ),
+    )
+
+
+async def vika_write_commit(args: Dict[str, Any], services: RuntimeServices) -> Any:
+    return await services.write_plans.commit(
+        args["operation_id"],
+        args.get("confirmed_payload_hash"),
+        args.get("confirmed_by_user") is True,
+        args.get("user_confirmation_summary"),
+    )
+
+
+async def vika_records_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.records_get(args["datasheet_id"], args["record_ids"], args.get("fields"), args.get("field_key")))
 
 
-async def vika_fields_get(args: Dict[str, Any]) -> Any:
+async def vika_fields_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.fields_get(args["datasheet_id"], args["field_id_or_name"]))
 
 
-async def vika_fields_create(args: Dict[str, Any]) -> Any:
+async def vika_fields_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    payload = {"name": args["name"], "field_type": args["field_type"], "property": args.get("property")}
-    if not _should_execute(args):
-        return _preview("fields.create", {"datasheet_id": args["datasheet_id"], "space_id": args["space_id"]}, payload)
-    return await _execute("fields.create", _CLIENT.fields_create(args["datasheet_id"], args["space_id"], args["name"], args["field_type"], args.get("property")))
+    payload = {
+        "datasheet_id": args["datasheet_id"],
+        "space_id": args["space_id"],
+        "name": args["name"],
+        "field_type": args["field_type"],
+        "property": args.get("property"),
+    }
+    return services.write_plans.preview(
+        "fields.create",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        [payload["name"]],
+        1,
+        lambda operation: _CLIENT.fields_create(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["space_id"],
+            operation["payload"]["name"],
+            operation["payload"]["field_type"],
+            operation["payload"].get("property"),
+        ),
+    )
 
 
-async def vika_fields_delete(args: Dict[str, Any]) -> Any:
+async def vika_fields_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    if not _should_execute(args):
-        return _preview("fields.delete", {"datasheet_id": args["datasheet_id"], "space_id": args["space_id"], "field_id_or_name": args["field_id_or_name"]}, {})
-    return await _execute("fields.delete", _CLIENT.fields_delete(args["datasheet_id"], args["space_id"], args["field_id_or_name"]))
+    payload = {
+        "datasheet_id": args["datasheet_id"],
+        "space_id": args["space_id"],
+        "field_id_or_name": args["field_id_or_name"],
+    }
+    return services.write_plans.preview(
+        "fields.delete",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        [payload["field_id_or_name"]],
+        1,
+        lambda operation: _CLIENT.fields_delete(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["space_id"],
+            operation["payload"]["field_id_or_name"],
+        ),
+    )
 
 
-async def vika_views_get(args: Dict[str, Any]) -> Any:
+async def vika_views_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
     return _raise_if_error(await _CLIENT.views_get(args["datasheet_id"], args["view_id_or_name"]))
 
 
-async def vika_attachments_upload(args: Dict[str, Any]) -> Any:
+async def vika_attachments_upload(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    if not _should_execute(args):
-        return _preview("attachments.upload", {"datasheet_id": args["datasheet_id"]}, {"file_path": args["file_path"]})
-    return await _execute("attachments.upload", _CLIENT.attachments_upload(args["datasheet_id"], args["file_path"]))
+    payload = {"datasheet_id": args["datasheet_id"], "file_path": args["file_path"]}
+    return services.write_plans.preview(
+        "attachments.upload",
+        args["datasheet_id"],
+        args.get("target_label") or args["datasheet_id"],
+        payload,
+        [],
+        1,
+        lambda operation: _CLIENT.attachments_upload(
+            operation["payload"]["datasheet_id"],
+            operation["payload"]["file_path"],
+        ),
+    )
 
 
-async def vika_attachments_download(args: Dict[str, Any]) -> Any:
+async def vika_attachments_download(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.attachments_download(args.get("url"), args.get("attachment"), args.get("save_path")))
+    return _raise_if_error(await _CLIENT.attachments_download(args["url"], None, args.get("save_path")))
 
 
-async def vika_datasheets_create(args: Dict[str, Any]) -> Any:
+async def vika_datasheets_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    payload = {key: args.get(key) for key in ("name", "description", "folder_id", "pre_filled_records") if key in args}
-    if not _should_execute(args):
-        return _preview("datasheets.create", {"space_id": args["space_id"]}, payload)
-    return await _execute("datasheets.create", _CLIENT.datasheets_create(args["space_id"], args["name"], args.get("description"), args.get("folder_id"), args.get("pre_filled_records")))
+    payload = {"space_id": args["space_id"], **{key: args.get(key) for key in ("name", "description", "folder_id", "pre_filled_records") if key in args}}
+    return services.write_plans.preview(
+        "datasheets.create",
+        args["space_id"],
+        args.get("name") or args["space_id"],
+        payload,
+        [],
+        1,
+        lambda operation: _CLIENT.datasheets_create(
+            operation["payload"]["space_id"],
+            operation["payload"]["name"],
+            operation["payload"].get("description"),
+            operation["payload"].get("folder_id"),
+            operation["payload"].get("pre_filled_records"),
+        ),
+    )
 
 
 def _schema(properties: Dict[str, Any], required: Optional[List[str]] = None, additional: bool = False) -> Dict[str, Any]:
@@ -948,30 +1103,77 @@ def _schema(properties: Dict[str, Any], required: Optional[List[str]] = None, ad
 
 def _with_safety(properties: Dict[str, Any]) -> Dict[str, Any]:
     props = dict(properties)
-    props["dry_run"] = {
-        "type": "boolean",
-        "description": "默认 true，仅返回 preview_only 预览且不执行；必须为 false 才可能真实执行",
-    }
-    props["confirm"] = {
-        "type": "boolean",
-        "description": "调用方声明已完成上层确认；只有 dry_run=false 且 confirm=true 才真实执行",
+    props["target_label"] = {
+        "type": "string",
+        "description": "人类可读目标表/节点名称，用于 confirmation_context；缺省时使用目标 ID。",
     }
     return props
+
+
+def _domain_for_tool(name: str) -> str:
+    if name in WRITE_TOOLS:
+        return "write"
+    if name in {"vika.status", "vika.healthcheck"}:
+        return "connection"
+    if ".catalog." in name or ".nodes." in name:
+        return "discovery"
+    if ".schema." in name or ".fields.get" in name or ".views.get" in name:
+        return "schema"
+    if ".records.query" in name or ".records.get" in name:
+        return "query"
+    if ".records.read_all" in name or name == "vika_export_records":
+        return "export"
+    return "admin"
+
+
+def _risk_for_tool(name: str) -> str:
+    if ".delete" in name or name.endswith(".clear"):
+        return "high"
+    if name in WRITE_TOOLS:
+        return "medium"
+    return "low"
+
+
+def _aliases_for_tool(name: str, tags: Optional[List[str]]) -> List[str]:
+    aliases = list(tags or [])
+    if ".catalog." in name or ".nodes." in name:
+        aliases.extend(["查找", "搜索", "定位", "表", "目录"])
+    if ".schema." in name or ".fields." in name or ".views." in name:
+        aliases.extend(["字段", "列", "表头", "视图", "schema"])
+    if ".records.query" in name or ".records.get" in name:
+        aliases.extend(["查询", "记录", "样本", "筛选"])
+    if ".records.read_all" in name or name == "vika_export_records":
+        aliases.extend(["导出", "全量", "批量读取"])
+    if name in WRITE_TOOLS:
+        aliases.extend(["新增", "写入", "创建", "更新", "修改", "删除"])
+    return sorted(set(aliases))
+
+
+def _result_policy_for_tool(name: str) -> Dict[str, Any]:
+    if ".records.read_all" in name or name == "vika_export_records":
+        return {"mode": "artifact", "default_format": "csv", "supported_formats": ["csv", "jsonl"]}
+    if ".records.query" in name:
+        return {"mode": "inline", "default_page_size": 50, "max_page_size": 100, "max_chars": 20000}
+    return {"mode": "inline", "max_chars": 20000}
 
 
 def _register(
     registry: ToolRegistry,
     name: str,
     description: str,
-    handler: Callable[[Dict[str, Any]], Any],
+    handler: Callable[[Dict[str, Any], RuntimeServices], Any],
     properties: Dict[str, Any],
     required: Optional[List[str]] = None,
     tags: Optional[List[str]] = None,
     available: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    services: Optional[RuntimeServices] = None,
 ) -> int:
     assert _CLIENT is not None
-    spec = ToolSpec(
+    runtime_services = services or RuntimeServices()
+    domain = _domain_for_tool(name)
+    risk = _risk_for_tool(name)
+    spec = ToolDefinition(
         name=name,
         description=description,
         input_schema=_schema(properties, required),
@@ -980,58 +1182,123 @@ def _register(
         available=_CLIENT.configured if available is None else available,
         unavailable_reason=None if (available is True or _CLIENT.configured) else "astral_vika not configured",
         tags=tags or ["vika"],
+        domain=domain,
+        risk=risk,
+        exposure="hidden",
+        result_policy=_result_policy_for_tool(name),
+        aliases=_aliases_for_tool(name, tags),
+        annotations={
+            "readOnlyHint": name not in WRITE_TOOLS,
+            "destructiveHint": ".delete" in name or name.endswith(".clear"),
+            "idempotentHint": name not in WRITE_TOOLS,
+        },
+        read_only=name not in WRITE_TOOLS,
+        write=name in WRITE_TOOLS,
+        destructive=".delete" in name or name.endswith(".clear"),
     )
-    registry.register(spec, handler)
+    registry.register(spec, lambda args: handler(args, runtime_services))
     return 1
 
 
-def try_register_vika_tools(registry: ToolRegistry) -> int:
+def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeServices] = None) -> int:
     global _CLIENT
     cfg = load_config()
     ttl_hours = getattr(cfg.cache, "ttl_hours", None) or getattr(cfg.vika, "cache_duration_hours", 24)
     cache = CatalogCache(db_path=cfg.cache.db_path, ttl_hours=ttl_hours, enabled=cfg.cache.enabled)
     _CLIENT = VikaClient(api_token=cfg.vika.api_token, host=cfg.vika.host, default_space_id=cfg.vika.default_space_id, cache=cache)
+    runtime_services = services or RuntimeServices()
+
+    def register(
+        name: str,
+        description: str,
+        handler: Callable[[Dict[str, Any], RuntimeServices], Any],
+        properties: Dict[str, Any],
+        required: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        available: Optional[bool] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        return _register(
+            registry,
+            name,
+            description,
+            handler,
+            properties,
+            required,
+            tags,
+            available,
+            output_schema,
+            services=runtime_services,
+        )
 
     registered = 0
     str_prop = {"type": "string"}
     bool_prop = {"type": "boolean"}
     int_prop = {"type": "integer", "minimum": 1}
+    export_max_records_prop = {"type": "integer", "minimum": 1, "maximum": 100000}
     fields_prop = {"type": "array", "items": {"type": "string"}}
     sort_prop = {"type": "array", "items": {"type": "object"}}
     field_key_prop = {"type": "string", "enum": ["name", "id"]}
 
-    registered += _register(registry, "vika.status", "返回 MCP 的 Vika 配置状态，不做真实网络请求。", vika_status, {}, available=True)
-    registered += _register(registry, "vika.healthcheck", "真实请求 Vika API，检查配置和网络/API 可达性。", vika_healthcheck, {}, available=True)
-    registered += _register(registry, "vika.spaces.list", "列出可访问空间，支持缓存。", vika_spaces_list, {"use_cache": bool_prop, "force_refresh": bool_prop})
-    registered += _register(registry, "vika.nodes.list", "列出指定空间站节点，支持缓存。", vika_nodes_list, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.search", "按名称、类型或权限搜索节点，优先使用缓存。", vika_nodes_search, {"space_id": str_prop, "query": str_prop, "node_type": str_prop, "permissions": {"type": ["integer", "string", "array"]}, "use_cache": bool_prop, "force_refresh": bool_prop, "limit": int_prop}, ["space_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.tree", "返回指定空间的文件夹/节点树。", vika_nodes_tree, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.get", "获取指定节点详情。", vika_nodes_get, {"space_id": str_prop, "node_id": str_prop, "use_cache": bool_prop}, ["space_id", "node_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.embedlinks.list", "列出节点嵌入链接。", vika_nodes_embedlinks_list, {"space_id": str_prop, "node_id": str_prop}, ["space_id", "node_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.embedlinks.create", "创建节点嵌入链接，默认 dry-run。", vika_nodes_embedlinks_create, _with_safety({"space_id": str_prop, "node_id": str_prop, "theme": str_prop, "payload": {"type": "object"}}), ["space_id", "node_id"], ["vika", "nodes"])
-    registered += _register(registry, "vika.nodes.embedlinks.delete", "删除节点嵌入链接，默认 dry-run。", vika_nodes_embedlinks_delete, _with_safety({"space_id": str_prop, "node_id": str_prop, "link_id": str_prop}), ["space_id", "node_id", "link_id"], ["vika", "nodes"])
+    registered += register("vika.status", "返回 MCP 的 Vika 配置状态，不做真实网络请求。", vika_status, {}, available=True)
+    registered += register("vika.healthcheck", "真实请求 Vika API，检查配置和网络/API 可达性。", vika_healthcheck, {}, available=True)
+    registered += register("vika.spaces.list", "列出可访问空间，支持缓存。", vika_spaces_list, {"use_cache": bool_prop, "force_refresh": bool_prop})
+    registered += register("vika.nodes.list", "列出指定空间站节点，支持缓存。", vika_nodes_list, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.search", "按名称、类型或权限搜索节点，优先使用缓存。", vika_nodes_search, {"space_id": str_prop, "query": str_prop, "node_type": str_prop, "permissions": {"type": ["integer", "string", "array"]}, "use_cache": bool_prop, "force_refresh": bool_prop, "limit": int_prop}, ["space_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.tree", "返回指定空间的文件夹/节点树。", vika_nodes_tree, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.get", "获取指定节点详情。", vika_nodes_get, {"space_id": str_prop, "node_id": str_prop, "use_cache": bool_prop}, ["space_id", "node_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.embedlinks.list", "列出节点嵌入链接。", vika_nodes_embedlinks_list, {"space_id": str_prop, "node_id": str_prop}, ["space_id", "node_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.embedlinks.create", "创建节点嵌入链接 preview，不直接执行；执行必须走 vika.write.commit。", vika_nodes_embedlinks_create, _with_safety({"space_id": str_prop, "node_id": str_prop, "theme": str_prop, "payload": {"type": "object"}}), ["space_id", "node_id"], ["vika", "nodes"])
+    registered += register("vika.nodes.embedlinks.delete", "删除节点嵌入链接 preview，不直接执行；执行必须走 vika.write.commit。", vika_nodes_embedlinks_delete, _with_safety({"space_id": str_prop, "node_id": str_prop, "link_id": str_prop}), ["space_id", "node_id", "link_id"], ["vika", "nodes"])
 
-    registered += _register(registry, "vika.catalog.refresh", "刷新 SQLite catalog 缓存，可选拉取字段和视图。", vika_catalog_refresh, {"space_id": str_prop, "include_fields": bool_prop, "include_views": bool_prop, "force": bool_prop}, tags=["vika", "catalog"])
-    registered += _register(registry, "vika.catalog.status", "返回 catalog 缓存状态。", vika_catalog_status, {}, tags=["vika", "catalog"])
-    registered += _register(registry, "vika.catalog.search", "确定性检索缓存中的表格/节点候选。", vika_catalog_search, {"query": str_prop, "space_id": str_prop, "node_type": str_prop, "limit": int_prop}, ["query"], ["vika", "catalog"])
-    registered += _register(registry, "vika.catalog.get", "按缓存 item_type 和 item_id 获取 catalog 项。", vika_catalog_get, {"item_type": {"type": "string", "enum": ["space", "node", "datasheet", "field", "view"]}, "item_id": str_prop}, ["item_type", "item_id"], ["vika", "catalog"])
-    registered += _register(registry, "vika.catalog.clear", "清理当前 token namespace 的 catalog 缓存。", vika_catalog_clear, {"space_id": str_prop}, tags=["vika", "catalog"])
-    registered += _register(registry, "vika.schema.get", "获取数据表字段和视图 schema，优先读缓存。", vika_schema_get, {"datasheet_id": str_prop, "space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["datasheet_id"], ["vika", "schema"])
+    registered += register("vika.catalog.refresh", "刷新 SQLite catalog 缓存，可选拉取字段和视图。", vika_catalog_refresh, {"space_id": str_prop, "include_fields": bool_prop, "include_views": bool_prop, "force": bool_prop}, tags=["vika", "catalog"])
+    registered += register("vika.catalog.status", "返回 catalog 缓存状态。", vika_catalog_status, {}, tags=["vika", "catalog"])
+    registered += register("vika.catalog.search", "确定性检索缓存中的表格/节点候选。", vika_catalog_search, {"query": str_prop, "space_id": str_prop, "node_type": str_prop, "limit": int_prop}, ["query"], ["vika", "catalog"])
+    registered += register("vika.catalog.get", "按缓存 item_type 和 item_id 获取 catalog 项。", vika_catalog_get, {"item_type": {"type": "string", "enum": ["space", "node", "datasheet", "field", "view"]}, "item_id": str_prop}, ["item_type", "item_id"], ["vika", "catalog"])
+    registered += register("vika.catalog.clear", "清理当前 token namespace 的 catalog 缓存。", vika_catalog_clear, {"space_id": str_prop}, tags=["vika", "catalog"])
+    registered += register("vika.schema.get", "获取数据表字段和视图 schema，优先读缓存。", vika_schema_get, {"datasheet_id": str_prop, "space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["datasheet_id"], ["vika", "schema"])
 
-    registered += _register(registry, "vika.records.query", "分页查询记录，返回 records/has_more/next_offset/total。", vika_records_query, {"datasheet_id": str_prop, "view_id": str_prop, "formula": str_prop, "fields": fields_prop, "page_size": int_prop, "page_num": int_prop, "page_token": str_prop, "sort": sort_prop, "field_key": field_key_prop}, ["datasheet_id"], ["vika", "records"])
-    registered += _register(registry, "vika.records.read_all", "批量读取多页记录；必须提供 max_records 或 max_pages。", vika_records_read_all, {"datasheet_id": str_prop, "view_id": str_prop, "formula": str_prop, "fields": fields_prop, "page_size": int_prop, "max_records": int_prop, "max_pages": int_prop, "sort": sort_prop, "field_key": field_key_prop}, ["datasheet_id"], ["vika", "records"])
-    registered += _register(registry, "vika.records.create", "创建记录，默认 dry-run。", vika_records_create, _with_safety({"datasheet_id": str_prop, "records": {"type": ["array", "object"], "items": {"type": "object"}}, "field_key": field_key_prop}), ["datasheet_id", "records"], ["vika", "records"])
-    registered += _register(registry, "vika.records.update", "更新记录，默认 dry-run。", vika_records_update, _with_safety({"datasheet_id": str_prop, "records": {"type": ["array", "object"], "items": {"type": "object"}}, "field_key": field_key_prop}), ["datasheet_id", "records"], ["vika", "records"])
-    registered += _register(registry, "vika.records.delete", "删除记录，默认 dry-run。", vika_records_delete, _with_safety({"datasheet_id": str_prop, "record_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}}), ["datasheet_id", "record_ids"], ["vika", "records"])
-    registered += _register(registry, "vika.records.get", "按记录 ID 批量获取记录。", vika_records_get, {"datasheet_id": str_prop, "record_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "fields": fields_prop, "field_key": field_key_prop}, ["datasheet_id", "record_ids"], ["vika", "records"])
+    registered += register("vika.records.query", "分页查询记录，返回 records/has_more/next_offset/total。", vika_records_query, {"datasheet_id": str_prop, "view_id": str_prop, "formula": str_prop, "fields": fields_prop, "page_size": int_prop, "page_num": int_prop, "page_token": str_prop, "sort": sort_prop, "field_key": field_key_prop}, ["datasheet_id"], ["vika", "records"])
+    registered += register("vika.records.read_all", "批量读取多页记录；必须提供 max_records 或 max_pages。", vika_records_read_all, {"datasheet_id": str_prop, "view_id": str_prop, "formula": str_prop, "fields": fields_prop, "page_size": int_prop, "max_records": int_prop, "max_pages": int_prop, "sort": sort_prop, "field_key": field_key_prop}, ["datasheet_id"], ["vika", "records"])
+    registered += register(
+        "vika_export_records",
+        "导出有界记录到服务端 CSV artifact，返回 artifact_id、manifest 和后续 artifact_search/read 操作。必须提供 max_records，硬上限 100000；format 缺省为 csv，可显式选择 jsonl。",
+        vika_export_records,
+        {
+            "datasheet_id": str_prop,
+            "view_id": str_prop,
+            "formula": str_prop,
+            "fields": fields_prop,
+            "page_size": int_prop,
+            "max_records": export_max_records_prop,
+            "max_pages": int_prop,
+            "sort": sort_prop,
+            "field_key": field_key_prop,
+            "format": {"type": "string", "enum": ["csv", "jsonl"]},
+        },
+        ["datasheet_id", "max_records"],
+        ["vika", "records", "export"],
+    )
+    registered += register("vika.records.create", "创建记录 preview，不直接执行；根据 confirmation_context/brief 向用户一句话确认后，用 payload hash 调用 vika.write.commit。", vika_records_create, _with_safety({"datasheet_id": str_prop, "records": {"type": ["array", "object"], "items": {"type": "object"}}, "field_key": field_key_prop}), ["datasheet_id", "records"], ["vika", "records"])
+    registered += register("vika.records.update", "更新记录 preview，不直接执行；根据 confirmation_context/brief 向用户一句话确认后，用 payload hash 调用 vika.write.commit。", vika_records_update, _with_safety({"datasheet_id": str_prop, "records": {"type": ["array", "object"], "items": {"type": "object"}}, "field_key": field_key_prop}), ["datasheet_id", "records"], ["vika", "records"])
+    registered += register("vika.records.delete", "删除记录 preview，不直接执行；根据 confirmation_context/brief 向用户一句话确认后，用 payload hash 调用 vika.write.commit。", vika_records_delete, _with_safety({"datasheet_id": str_prop, "record_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}}), ["datasheet_id", "record_ids"], ["vika", "records"])
+    registered += register("vika.write.commit", "提交已由 preview 生成并经用户确认的一次写入计划。必须提供 operation_id、confirmed_payload_hash 和 confirmed_by_user=true；user_confirmation_summary 仅用于审计。", vika_write_commit, {"operation_id": str_prop, "confirmed_payload_hash": str_prop, "confirmed_by_user": bool_prop, "user_confirmation_summary": str_prop}, ["operation_id", "confirmed_payload_hash", "confirmed_by_user"], ["vika", "write"])
+    registered += register("vika.records.get", "按记录 ID 批量获取记录。", vika_records_get, {"datasheet_id": str_prop, "record_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "fields": fields_prop, "field_key": field_key_prop}, ["datasheet_id", "record_ids"], ["vika", "records"])
 
-    registered += _register(registry, "vika.fields.get", "按 ID 或名称获取字段。", vika_fields_get, {"datasheet_id": str_prop, "field_id_or_name": str_prop}, ["datasheet_id", "field_id_or_name"], ["vika", "fields"])
-    registered += _register(registry, "vika.fields.create", "创建字段，默认 dry-run。", vika_fields_create, _with_safety({"datasheet_id": str_prop, "space_id": str_prop, "name": str_prop, "field_type": str_prop, "property": {"type": "object"}}), ["datasheet_id", "space_id", "name", "field_type"], ["vika", "fields"])
-    registered += _register(registry, "vika.fields.delete", "删除字段，默认 dry-run。", vika_fields_delete, _with_safety({"datasheet_id": str_prop, "space_id": str_prop, "field_id_or_name": str_prop}), ["datasheet_id", "space_id", "field_id_or_name"], ["vika", "fields"])
-    registered += _register(registry, "vika.views.get", "按 ID 或名称获取视图。", vika_views_get, {"datasheet_id": str_prop, "view_id_or_name": str_prop}, ["datasheet_id", "view_id_or_name"], ["vika", "views"])
-    registered += _register(registry, "vika.attachments.upload", "上传附件，默认 dry-run。", vika_attachments_upload, _with_safety({"datasheet_id": str_prop, "file_path": str_prop}), ["datasheet_id", "file_path"], ["vika", "attachments"])
-    registered += _register(registry, "vika.attachments.download", "下载附件到本地。", vika_attachments_download, {"url": str_prop, "attachment": {"type": "object"}, "save_path": str_prop}, tags=["vika", "attachments"])
-    registered += _register(registry, "vika.datasheets.create", "创建数据表，默认 dry-run。", vika_datasheets_create, _with_safety({"space_id": str_prop, "name": str_prop, "description": str_prop, "folder_id": str_prop, "pre_filled_records": {"type": "array", "items": {"type": "object"}}}), ["space_id", "name"], ["vika", "datasheets"])
+    registered += register("vika.fields.get", "按 ID 或名称获取字段。", vika_fields_get, {"datasheet_id": str_prop, "field_id_or_name": str_prop}, ["datasheet_id", "field_id_or_name"], ["vika", "fields"])
+    registered += register("vika.fields.create", "创建字段 preview，不直接执行；执行必须走 vika.write.commit。", vika_fields_create, _with_safety({"datasheet_id": str_prop, "space_id": str_prop, "name": str_prop, "field_type": str_prop, "property": {"type": "object"}}), ["datasheet_id", "space_id", "name", "field_type"], ["vika", "fields"])
+    registered += register("vika.fields.delete", "删除字段 preview，不直接执行；执行必须走 vika.write.commit。", vika_fields_delete, _with_safety({"datasheet_id": str_prop, "space_id": str_prop, "field_id_or_name": str_prop}), ["datasheet_id", "space_id", "field_id_or_name"], ["vika", "fields"])
+    registered += register("vika.views.get", "按 ID 或名称获取视图。", vika_views_get, {"datasheet_id": str_prop, "view_id_or_name": str_prop}, ["datasheet_id", "view_id_or_name"], ["vika", "views"])
+    registered += register("vika.attachments.upload", "上传附件 preview，不直接执行；执行必须走 vika.write.commit。", vika_attachments_upload, _with_safety({"datasheet_id": str_prop, "file_path": str_prop}), ["datasheet_id", "file_path"], ["vika", "attachments"])
+    registered += register(
+        "vika.attachments.download",
+        "按附件 URL 下载附件到本地。",
+        vika_attachments_download,
+        {"url": str_prop, "save_path": str_prop},
+        ["url"],
+        ["vika", "attachments"],
+    )
+    registered += register("vika.datasheets.create", "创建数据表 preview，不直接执行；执行必须走 vika.write.commit。", vika_datasheets_create, _with_safety({"space_id": str_prop, "name": str_prop, "description": str_prop, "folder_id": str_prop, "pre_filled_records": {"type": "array", "items": {"type": "object"}}}), ["space_id", "name", "folder_id"], ["vika", "datasheets"])
     return registered
 
 

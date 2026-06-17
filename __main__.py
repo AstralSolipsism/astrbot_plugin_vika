@@ -3,10 +3,17 @@ import sys
 import argparse
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="vika-mcp",
-        description="Start Vika MCP server with CLI overrides",
+        description="Start the standard Vika MCP server",
+    )
+    parser.add_argument(
+        "--transport",
+        dest="transport",
+        choices=["stdio", "streamable-http", "streamable_http"],
+        default="stdio",
+        help="Standard MCP transport to run: stdio or streamable-http.",
     )
     parser.add_argument(
         "--baseurl", "--base-url", "--api-base",
@@ -36,14 +43,17 @@ def parse_args():
     parser.add_argument(
         "--log-level",
         dest="log_level",
-        help="Uvicorn log level (override config.server.log_level)",
+        help="MCP server log level (override config.server.log_level)",
         default=None,
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.transport == "streamable_http":
+        args.transport = "streamable-http"
+    return args
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     # Inject CLI overrides via environment before app creation
     if args.config_path:
@@ -51,28 +61,20 @@ def main():
     if args.baseurl:
         os.environ["VIKAMCP_VIKA__HOST"] = args.baseurl
 
-    # Defer import to honor env overrides
+    # Defer import to honor env overrides.
     try:
-        from .server import create_app
+        from .standard_server import create_standard_mcp
     except Exception as e:
         print(f"Failed to import server: {e}", file=sys.stderr)
         sys.exit(1)
 
-    app = create_app()
-
-    # Read effective server params from the app's config
-    cfg = getattr(app.state, "config", None)
-    host = args.listen_host or (getattr(getattr(cfg, "server", None), "host", None) if cfg else None) or "localhost"
-    port = args.listen_port or (getattr(getattr(cfg, "server", None), "port", None) if cfg else None) or 8080
-    log_level = args.log_level or (getattr(getattr(cfg, "server", None), "log_level", None) if cfg else None) or "info"
-
-    try:
-        import uvicorn
-    except Exception:
-        print("uvicorn is required to run the server. Install with: pip install uvicorn", file=sys.stderr)
-        sys.exit(1)
-
-    uvicorn.run(app, host=host, port=port, log_level=str(log_level).lower())
+    server = create_standard_mcp(
+        host=args.listen_host,
+        port=args.listen_port,
+        log_level=args.log_level,
+        transport=args.transport,
+    )
+    server.run(transport=args.transport)
 
 
 if __name__ == "__main__":

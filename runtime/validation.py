@@ -41,6 +41,9 @@ def _validate_value(name: str, value: Any, schema: Dict[str, Any], errors: List[
     if isinstance(value, int) and "minimum" in schema and value < schema["minimum"]:
         errors.append(f"{name} must be >= {schema['minimum']}")
 
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and "maximum" in schema and value > schema["maximum"]:
+        errors.append(f"{name} must be <= {schema['maximum']}")
+
     if isinstance(value, list):
         min_items = schema.get("minItems")
         if min_items is not None and len(value) < min_items:
@@ -55,7 +58,7 @@ def _validate_value(name: str, value: Any, schema: Dict[str, Any], errors: List[
 
 
 def validate_arguments(args: Dict[str, Any], schema: Optional[Dict[str, Any]], prefix: str = "", errors: Optional[List[str]] = None) -> List[str]:
-    """Validate the small JSON-schema subset used by ToolSpec.input_schema."""
+    """Validate the small JSON-schema subset used by ToolDefinition.input_schema."""
     collected = errors if errors is not None else []
     if not schema:
         return collected

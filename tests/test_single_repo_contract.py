@@ -33,7 +33,7 @@ def test_requirements_use_versioned_astral_vika_dependency_not_editable_path() -
     assert not any(line.startswith("-e ") and "astral_vika" in line for line in normalized)
 
 
-def test_project_metadata_declares_mcp_package_and_astral_dependency() -> None:
+def test_project_metadata_declares_runtime_package_and_standard_mcp_dependency() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert metadata["project"]["name"] == "vika-mcp"
@@ -41,9 +41,11 @@ def test_project_metadata_declares_mcp_package_and_astral_dependency() -> None:
 
     dependencies = {dependency.lower() for dependency in metadata["project"]["dependencies"]}
     assert any(dependency.startswith("astral-vika") or dependency.startswith("astral_vika") for dependency in dependencies)
+    assert "mcp==1.12.4" in dependencies
 
     packages = set(metadata["tool"]["setuptools"]["packages"])
-    assert {"vika_mcp", "vika_mcp.mcp", "vika_mcp.tools"}.issubset(packages)
+    assert {"vika_mcp", "vika_mcp.runtime", "vika_mcp.tools"}.issubset(packages)
+    assert "vika_mcp.mcp" not in packages
     assert not any(package == "astral_vika" or package.startswith("astral_vika.") for package in packages)
 
     package_dir = metadata["tool"]["setuptools"]["package-dir"]
@@ -74,20 +76,27 @@ def test_vika_mcp_source_checkout_bootstraps_local_astral_vika() -> None:
     assert "imported=True;version=1.1.3" in result.stdout
 
 
-def test_standard_x_api_key_header_is_accepted() -> None:
-    sys.path.insert(0, str(ROOT.parent))
-    sys.path.insert(0, str(ROOT / "astral_vika" / "src"))
+def test_official_mcp_sdk_import_is_not_shadowed_by_source_checkout() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from mcp.server.fastmcp import FastMCP; "
+                "import mcp; "
+                "print(f'{FastMCP.__name__};{mcp.__file__}')"
+            ),
+        ],
+        cwd=ROOT,
+        env=_python_env([ROOT.parent]),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
 
-    from fastapi.testclient import TestClient
-    from vika_mcp.server import create_app
-
-    env = os.environ.copy()
-    os.environ["VIKAMCP_API_KEY"] = "secret"
-    try:
-        client = TestClient(create_app())
-    finally:
-        os.environ.clear()
-        os.environ.update(env)
-
-    assert client.get("/mcp/v1/tools").status_code == 401
-    assert client.get("/mcp/v1/tools", headers={"X-API-Key": "secret"}).status_code == 200
+    assert result.returncode == 0, result.stderr
+    assert "FastMCP;" in result.stdout
+    assert "vika_mcp\\mcp" not in result.stdout.lower()
+    assert "vika_mcp/mcp" not in result.stdout.lower()
