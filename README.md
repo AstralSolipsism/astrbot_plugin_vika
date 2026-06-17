@@ -13,24 +13,44 @@ The Vika SDK remains a separate package:
 
 ```powershell
 $env:VIKAMCP_VIKA__API_TOKEN="your-vika-token"
-python -m vika_mcp --host localhost --port 8080
+$env:VIKAMCP_VIKA__WORKBENCH_URL="https://vika.cn/workbench/fod6mElQf7PFD"
+$env:VIKAMCP_VIKA__WORKBENCH_SPACE_ID="your-workbench-space-id"
+python -m vika_mcp --transport stdio
 ```
 
-The default HTTP API exposes:
+When `VIKAMCP_VIKA__WORKBENCH_URL` points to a folder workbench (`fod...`),
+`VIKAMCP_VIKA__WORKBENCH_SPACE_ID` is required so the resolver can stay inside
+that space without scanning all token-visible spaces.
 
-- `GET /.well-known/healthz`
-- `GET /mcp/v1/tools`
-- `POST /mcp/v1/execute`
-- `GET /mcp/v1/stream/{job_id}`
+For Streamable HTTP:
 
-Write tools default to dry-run. Real writes require both:
+```powershell
+python -m vika_mcp --transport streamable-http --host 127.0.0.1 --port 8080
+```
+
+The Streamable HTTP MCP endpoint is `/mcp`. The server does not expose the old
+custom HTTP execute API. If Streamable HTTP is bound to a non-localhost address,
+set an independent `VIKAMCP_MCP_BEARER_TOKEN`; do not reuse the Vika API token.
 
 ```json
 {
-  "dry_run": false,
-  "confirm": true
+  "mcpServers": {
+    "vika": {
+      "command": "python",
+      "args": ["-m", "vika_mcp", "--transport", "stdio"],
+      "env": {
+        "VIKAMCP_VIKA__API_TOKEN": "your-vika-token",
+        "VIKAMCP_VIKA__WORKBENCH_URL": "https://vika.cn/workbench/fod6mElQf7PFD",
+        "VIKAMCP_VIKA__WORKBENCH_SPACE_ID": "your-workbench-space-id"
+      }
+    }
+  }
 }
 ```
+
+The model sees stable meta tools first: guide, resolve, search, route, describe,
+call, domain controls, and artifact readers. Business Vika tools stay hidden and
+are invoked through `vika_call_tool` after `vika_describe_tool`.
 
 ## Test
 
