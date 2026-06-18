@@ -1,8 +1,9 @@
 ﻿import hashlib
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from ..cache import CatalogCache
+from ..cache import CatalogCache, catalog_readiness_error
 from ..config import load_config
 from ..runtime.limits import enforce_inline_record_limit, normalize_query_page_size
 from ..runtime.registry import ToolRegistry
@@ -39,18 +40,131 @@ WRITE_TOOLS = {
 }
 
 
+TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
+    "vika.schema.get": {
+        "capability": "schema.get",
+        "aliases": ["schema", "schema get", "schema fields", "table schema", "表结构", "字段和视图", "读取表结构"],
+        "priority": 760,
+    },
+    "vika.fields.get": {
+        "capability": "fields.get",
+        "aliases": ["fields.get", "fields get", "field get", "字段", "获取字段", "字段详情"],
+        "priority": 740,
+    },
+    "vika.views.get": {
+        "capability": "views.get",
+        "aliases": ["views.get", "views get", "view get", "视图", "获取视图", "视图详情"],
+        "priority": 740,
+    },
+    "vika.records.query": {
+        "capability": "records.query",
+        "aliases": ["records query", "query records", "records.query", "查询记录", "检索记录", "筛选记录", "分页查询记录"],
+        "priority": 820,
+    },
+    "vika.records.get": {
+        "capability": "records.get",
+        "aliases": ["records get", "get records", "records.get", "按记录ID获取", "获取指定记录"],
+        "priority": 780,
+    },
+    "vika_export_records": {
+        "capability": "records.export",
+        "aliases": ["records export", "export records", "records.export", "导出记录", "导出全量记录", "csv export"],
+        "priority": 860,
+    },
+    "vika.records.create": {
+        "capability": "records.create",
+        "aliases": ["records create", "create records", "create record", "insert record", "add record", "records.create", "新增记录", "添加记录", "写入记录", "创建记录"],
+        "priority": 920,
+    },
+    "vika.records.update": {
+        "capability": "records.update",
+        "aliases": ["records update", "update records", "update record", "records.update", "更新记录", "修改记录"],
+        "priority": 910,
+    },
+    "vika.records.delete": {
+        "capability": "records.delete",
+        "aliases": ["records delete", "delete records", "delete record", "records.delete", "删除记录", "移除记录"],
+        "priority": 910,
+    },
+    "vika.write.commit": {
+        "capability": "write.commit",
+        "aliases": ["write commit", "commit write", "payload hash", "confirmed_payload_hash", "提交写入", "确认写入", "执行写入", "提交变更"],
+        "priority": 980,
+    },
+    "vika.fields.create": {
+        "capability": "fields.create",
+        "aliases": ["fields create", "create field", "fields.create", "创建字段", "新增字段", "添加字段"],
+        "priority": 840,
+    },
+    "vika.fields.delete": {
+        "capability": "fields.delete",
+        "aliases": ["fields delete", "delete field", "fields.delete", "删除字段", "移除字段"],
+        "priority": 830,
+    },
+    "vika.datasheets.create": {
+        "capability": "datasheets.create",
+        "aliases": ["datasheets create", "create datasheet", "datasheets.create", "创建数据表", "新建数据表", "创建表格"],
+        "priority": 900,
+    },
+    "vika.attachments.upload": {
+        "capability": "attachments.upload",
+        "aliases": ["attachments upload", "upload attachment", "attachments.upload", "上传附件", "上传文件"],
+        "priority": 760,
+    },
+    "vika.attachments.download": {
+        "capability": "attachments.download",
+        "aliases": ["attachments download", "download attachment", "attachments.download", "下载附件", "下载文件"],
+        "priority": 760,
+    },
+    "vika.nodes.embedlinks.create": {
+        "capability": "embedlinks.create",
+        "aliases": ["embedlinks create", "create embedlink", "embedlinks.create", "创建嵌入链接"],
+        "priority": 620,
+    },
+    "vika.nodes.embedlinks.delete": {
+        "capability": "embedlinks.delete",
+        "aliases": ["embedlinks delete", "delete embedlink", "embedlinks.delete", "删除嵌入链接"],
+        "priority": 610,
+    },
+    "vika.nodes.embedlinks.list": {
+        "capability": "embedlinks.list",
+        "aliases": ["embedlinks list", "list embedlinks", "embedlinks.list", "列出嵌入链接", "查看嵌入链接"],
+        "priority": 600,
+    },
+    "vika.catalog.status": {
+        "capability": "catalog.status",
+        "aliases": ["catalog status", "catalog.status", "缓存状态"],
+        "priority": 500,
+    },
+    "vika.catalog.search": {
+        "capability": "catalog.search",
+        "aliases": ["catalog search", "catalog.search"],
+        "priority": 500,
+    },
+    "vika.catalog.get": {
+        "capability": "catalog.get",
+        "aliases": ["catalog get", "catalog.get"],
+        "priority": 500,
+    },
+}
+
+
 class VikaClient:
     def __init__(
         self,
         api_token: Optional[str],
         host: Optional[str] = None,
         default_space_id: Optional[str] = None,
+        workbench_space_id: Optional[str] = None,
         cache: Optional[CatalogCache] = None,
     ) -> None:
         self.api_token = api_token
         self.host = (host or DEFAULT_API_BASE or "https://vika.cn").rstrip("/")
         self.default_space_id = default_space_id
+        self.workbench_space_id = workbench_space_id
         self.cache = cache
+        self._last_node_refresh_requests: List[Dict[str, Any]] = []
+        self._last_node_refresh_required_errors: List[Dict[str, Any]] = []
 
     @property
     def configured(self) -> bool:
@@ -154,29 +268,146 @@ class VikaClient:
                 items.append(ds_item)
         return items
 
+    def _catalog_index_node(self, node: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        node_id = node.get("id")
+        node_type = node.get("type")
+        allowed = node_type in {"Folder", "Datasheet"} or str(node_id or "").startswith(("fod", "dst"))
+        if not allowed:
+            return None
+        indexed = dict(node)
+        children = indexed.get("children")
+        if isinstance(children, list):
+            indexed["children"] = [
+                child
+                for child in (self._catalog_index_node(child) for child in children if isinstance(child, dict))
+                if child is not None
+            ]
+        return indexed
+
     async def _load_catalog_nodes_from_api(self, vika: Any, space_id: str) -> List[Dict[str, Any]]:
         space = vika.space(space_id)
         merged: Dict[str, Dict[str, Any]] = {}
+        refresh_requests: List[Dict[str, Any]] = []
+        required_errors: List[Dict[str, Any]] = []
 
         async def add_nodes(nodes: List[Any]) -> None:
             for node in nodes:
                 raw = node.raw_data if hasattr(node, "raw_data") else node
                 node_id = raw.get("id") if isinstance(raw, dict) else None
-                if node_id:
-                    merged[node_id] = raw
+                indexed = self._catalog_index_node(raw) if isinstance(raw, dict) else None
+                if node_id and indexed:
+                    merged[node_id] = indexed
 
-        try:
-            await add_nodes(await space.nodes.alist())
-        except Exception:
-            pass
-
-        for node_type in ("Folder", "Datasheet", "Form", "Dashboard"):
+        async def timed_add(request: str, call: Callable[[], Any], required: bool = False) -> None:
+            started_at = time.time()
             try:
-                await add_nodes(await space.nodes.asearch(node_type=node_type))
-            except Exception:
-                continue
+                nodes = await call()
+                await add_nodes(nodes)
+                refresh_requests.append(
+                    {
+                        "request": request,
+                        "duration_seconds": max(0.0, time.time() - started_at),
+                        "count": len(nodes or []),
+                        "error": None,
+                    }
+                )
+            except Exception as exc:
+                record = {
+                    "request": request,
+                    "duration_seconds": max(0.0, time.time() - started_at),
+                    "count": 0,
+                    "error": str(exc),
+                }
+                refresh_requests.append(record)
+                if required:
+                    required_errors.append(record)
 
+        await timed_add("nodes.alist", space.nodes.alist)
+
+        for node_type in ("Folder", "Datasheet"):
+            await timed_add(
+                f"nodes.asearch:{node_type}",
+                lambda node_type=node_type: space.nodes.asearch(node_type=node_type),
+                required=True,
+            )
+
+        self._last_node_refresh_requests = refresh_requests
+        self._last_node_refresh_required_errors = required_errors
         return list(merged.values())
+
+    def _catalog_refresh_scope_required(self) -> Dict[str, Any]:
+        return {
+            "error": {
+                "code": "catalog_refresh_scope_required",
+                "message": (
+                    "Catalog refresh requires an explicit bounded space_id, "
+                    "vika.workbench_space_id, or vika.default_space_id; token-wide space scanning is disabled."
+                ),
+                "details": {
+                    "workbench_space_id": self.workbench_space_id or None,
+                    "default_space_id": self.default_space_id or None,
+                },
+            }
+        }
+
+    def _resolve_catalog_refresh_space_id(self, space_id: Optional[str]) -> Optional[str]:
+        return space_id or self.workbench_space_id or self.default_space_id
+
+    def _catalog_refresh_failed(self, message: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        return {"error": {"code": "catalog_refresh_failed", "message": message, "details": details}}
+
+    def _catalog_cache_failure(
+        self,
+        message: str,
+        space_id: Optional[str],
+        stage: str,
+        exc: Exception,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        details: Dict[str, Any] = {
+            "space_id": space_id,
+            "stage": stage,
+            "error_type": exc.__class__.__name__,
+            "error_message": str(exc),
+        }
+        if extra:
+            details.update(extra)
+        return self._catalog_refresh_failed(message, details)
+
+    def _error_text(self, error: Any) -> str:
+        if isinstance(error, str):
+            return error
+        try:
+            return json.dumps(error, ensure_ascii=False)
+        except Exception:
+            return str(error)
+
+    def _record_failed_catalog_refresh(
+        self,
+        space_id: str,
+        counts: Dict[str, Any],
+        error: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self.cache:
+            return error
+        try:
+            self.cache.finish_refresh(self.namespace, space_id, counts, error=self._error_text(error))
+        except Exception as state_exc:
+            error.setdefault("details", {})["failed_state_error"] = {
+                "type": state_exc.__class__.__name__,
+                "message": str(state_exc),
+            }
+        return error
+
+    def _cache_disabled_error(self, space_id: Optional[str] = None) -> Dict[str, Any]:
+        return {"error": catalog_readiness_error({"catalog_status": "disabled", "enabled": False}, space_id)}
+
+    def _catalog_refresh_cache_unavailable(self, space_id: str) -> Optional[Dict[str, Any]]:
+        if self.cache and self.cache.enabled:
+            return None
+        result = self._cache_disabled_error(space_id)
+        result["cache"] = self.catalog_status(space_id=space_id)
+        return result
 
     def _make_schema_items(
         self,
@@ -281,26 +512,73 @@ class VikaClient:
             if vika is not None:
                 await vika.aclose()
 
-    async def nodes_list(self, space_id: str, use_cache: bool = True, force_refresh: bool = False) -> Dict[str, Any]:
+    async def nodes_list(
+        self,
+        space_id: str,
+        use_cache: bool = True,
+        force_refresh: bool = False,
+        cache_only: bool = False,
+    ) -> Dict[str, Any]:
+        if force_refresh and (not self.cache or not self.cache.enabled):
+            return self._cache_disabled_error(space_id)
         if self.cache and use_cache and not force_refresh:
             try:
-                cached = self.cache.list_items(self.namespace, "node", space_id=space_id, max_age_seconds=self._cache_max_age())
-                if cached:
-                    return {"nodes": cached, "source": "cache"}
-            except Exception:
-                pass
+                ready_discovery = self.cache.read_ready_discovery(self.namespace, space_id=space_id)
+                if not ready_discovery.get("ready"):
+                    if cache_only:
+                        return {"error": ready_discovery["error"]}
+                else:
+                    cached = ready_discovery.get("items", [])
+                    if cached or cache_only:
+                        return {"nodes": cached, "source": "cache", "catalog": ready_discovery["catalog"]}
+                if cache_only:
+                    return self._cache_disabled_error(space_id)
+            except Exception as exc:
+                if cache_only:
+                    return {
+                        "error": catalog_readiness_error(
+                            {"catalog_status": "failed", "last_refresh_error": str(exc)},
+                            space_id,
+                        )
+                    }
+        if cache_only:
+            return self._cache_disabled_error(space_id)
         vika = None
         try:
             vika = self._ensure_client()
             raw_nodes = await self._load_catalog_nodes_from_api(vika, space_id)
+            if self._last_node_refresh_required_errors:
+                return self._catalog_refresh_failed(
+                    "Catalog node refresh failed because required Folder/Datasheet requests did not complete.",
+                    {
+                        "space_id": space_id,
+                        "failed_requests": list(self._last_node_refresh_required_errors),
+                        "refresh_requests": list(self._last_node_refresh_requests),
+                    },
+                )
             items = self._make_node_items(space_id, raw_nodes)
             if self.cache:
                 try:
-                    self.cache.replace_items(self.namespace, space_id, "node", [item for item in items if item["type"] == "node"])
-                    self.cache.replace_items(self.namespace, space_id, "datasheet", [item for item in items if item["type"] == "datasheet"])
-                except Exception:
-                    pass
-            return {"nodes": items, "source": "api"}
+                    self.cache.replace_discovery_items(self.namespace, space_id, items)
+                except Exception as exc:
+                    if force_refresh:
+                        return self._catalog_cache_failure(
+                            "Catalog refresh failed while persisting discovery cache.",
+                            space_id,
+                            "cache_persist",
+                            exc,
+                            {"refresh_requests": list(self._last_node_refresh_requests)},
+                        )
+                    return {
+                        "nodes": items,
+                        "source": "api",
+                        "refresh_requests": list(self._last_node_refresh_requests),
+                        "cache_persist_error": {
+                            "type": exc.__class__.__name__,
+                            "message": str(exc),
+                        },
+                    }
+            return {"nodes": items, "source": "api", "refresh_requests": list(self._last_node_refresh_requests)}
         except Exception as exc:
             return self._wrap_error(exc)
         finally:
@@ -319,7 +597,13 @@ class VikaClient:
     ) -> Dict[str, Any]:
         if self.cache and use_cache:
             if force_refresh:
-                await self.nodes_list(space_id, use_cache=False, force_refresh=True)
+                return {
+                    "error": {
+                        "code": "catalog_refresh_required",
+                        "message": "Node search does not perform refresh; use the catalog refresh maintenance path.",
+                        "details": {"space_id": space_id},
+                    }
+                }
             try:
                 results = self.cache.search(self.namespace, query or "", space_id=space_id, node_type=node_type, limit=limit)
                 if results:
@@ -675,49 +959,173 @@ class VikaClient:
             if vika is not None:
                 await vika.aclose()
 
+    async def _refresh_schema_cache(
+        self,
+        datasheet_id: str,
+        space_id: Optional[str],
+        include_fields: bool,
+        include_views: bool,
+    ) -> Dict[str, Any]:
+        requested_types: List[str] = []
+        fields: List[Dict[str, Any]] = []
+        views: List[Dict[str, Any]] = []
+        if include_fields:
+            requested_types.append("field")
+        if include_views:
+            requested_types.append("view")
+        if not requested_types:
+            return {"datasheet_id": datasheet_id, "space_id": space_id, "fields": fields, "views": views, "source": "api"}
+
+        vika = None
+        try:
+            vika = self._ensure_client()
+            ds = vika.datasheet(datasheet_id, space_id=space_id)
+            if include_fields:
+                fields = [field.raw_data for field in await ds.fields.aall()]
+            if include_views:
+                views = [view.raw_data for view in await ds.views.aall()]
+            if self.cache:
+                try:
+                    self.cache.replace_schema_items(
+                        self.namespace,
+                        datasheet_id,
+                        self._make_schema_items(datasheet_id, fields, views, space_id=space_id),
+                        item_types=requested_types,
+                    )
+                except Exception as exc:
+                    return self._catalog_cache_failure(
+                        "Catalog refresh failed while persisting schema cache.",
+                        space_id,
+                        "cache_persist",
+                        exc,
+                        {"datasheet_id": datasheet_id, "item_types": requested_types},
+                    )
+            return {"datasheet_id": datasheet_id, "space_id": space_id, "fields": fields, "views": views, "source": "api"}
+        except Exception as exc:
+            return self._wrap_error(exc)
+        finally:
+            if vika is not None:
+                await vika.aclose()
+
     async def catalog_refresh(self, space_id: Optional[str] = None, include_fields: bool = False, include_views: bool = False, force: bool = False) -> Dict[str, Any]:
-        spaces_result = await self.spaces_list(use_cache=not force, force_refresh=force)
-        if "error" in spaces_result:
-            return spaces_result
-        spaces = spaces_result.get("spaces", [])
-        target_space_ids = [space_id] if space_id else [space.get("id") for space in spaces if space.get("id")]
-        counts = {"spaces": len(spaces), "nodes": 0, "datasheets": 0, "fields": 0, "views": 0}
+        target_space_id = self._resolve_catalog_refresh_space_id(space_id)
+        if not target_space_id:
+            return self._catalog_refresh_scope_required()
+
+        cache_unavailable = self._catalog_refresh_cache_unavailable(target_space_id)
+        if cache_unavailable is not None:
+            return cache_unavailable
+
+        if self.cache:
+            try:
+                self.cache.begin_refresh(self.namespace, target_space_id)
+            except Exception as exc:
+                return {
+                    **self._catalog_cache_failure(
+                        "Catalog refresh failed while beginning refresh state.",
+                        target_space_id,
+                        "refresh_state_begin",
+                        exc,
+                    ),
+                    "cache": self.catalog_status(space_id=target_space_id),
+                }
+        counts = {"spaces": 0, "nodes": 0, "datasheets": 0, "fields": 0, "views": 0, "requests": []}
+        target_space_ids = [target_space_id]
+        counts["spaces"] = 1
         for sid in target_space_ids:
             nodes_result = await self.nodes_list(sid, use_cache=False, force_refresh=True)
             if "error" in nodes_result:
-                return nodes_result
+                nodes_result["error"] = self._record_failed_catalog_refresh(sid, counts, nodes_result["error"])
+                result = dict(nodes_result)
+                result["counts"] = counts
+                result["cache"] = self.catalog_status(space_id=sid)
+                return result
             nodes = nodes_result.get("nodes", [])
+            counts["requests"].extend(nodes_result.get("refresh_requests", []))
             counts["nodes"] += len([item for item in nodes if item.get("type") == "node"])
             datasheets = [item for item in nodes if item.get("type") == "datasheet" and item.get("dst_id")]
             counts["datasheets"] += len(datasheets)
+            schema_errors: List[Dict[str, Any]] = []
             if include_fields or include_views:
                 for ds_item in datasheets:
-                    schema = await self.schema_get(ds_item["dst_id"], space_id=sid, use_cache=False, force_refresh=True)
-                    if "error" not in schema:
-                        counts["fields"] += len(schema.get("fields", [])) if include_fields else 0
-                        counts["views"] += len(schema.get("views", [])) if include_views else 0
-        return {"refreshed": True, "space_ids": target_space_ids, "counts": counts, "cache": self.catalog_status()}
+                    schema = await self._refresh_schema_cache(ds_item["dst_id"], sid, include_fields, include_views)
+                    if "error" in schema:
+                        schema_errors.append({"datasheet_id": ds_item["dst_id"], "space_id": sid, "error": schema["error"]})
+                        continue
+                    counts["fields"] += len(schema.get("fields", [])) if include_fields else 0
+                    counts["views"] += len(schema.get("views", [])) if include_views else 0
+            if schema_errors:
+                error = self._catalog_refresh_failed(
+                    "Catalog refresh failed during requested schema refresh: "
+                    + "; ".join(str(item["error"].get("message") or item["error"]) for item in schema_errors),
+                    {"space_id": sid, "failed_schema": schema_errors, "counts": counts},
+                )["error"]
+                error = self._record_failed_catalog_refresh(sid, counts, error)
+                return {"error": error, "counts": counts, "cache": self.catalog_status(space_id=sid)}
+        if self.cache:
+            try:
+                self.cache.finish_refresh(self.namespace, target_space_id, counts)
+            except Exception as exc:
+                error = self._catalog_cache_failure(
+                    "Catalog refresh failed while marking refresh state ready.",
+                    target_space_id,
+                    "refresh_state_finish",
+                    exc,
+                    {"counts": counts},
+                )["error"]
+                try:
+                    self.cache.finish_refresh(self.namespace, target_space_id, counts, error=self._error_text(error))
+                except Exception as state_exc:
+                    error["details"]["failed_state_error"] = {
+                        "type": state_exc.__class__.__name__,
+                        "message": str(state_exc),
+                    }
+                return {"error": error, "counts": counts, "cache": self.catalog_status(space_id=target_space_id)}
+        return {"refreshed": True, "space_ids": target_space_ids, "counts": counts, "cache": self.catalog_status(space_id=target_space_id)}
 
-    def catalog_status(self) -> Dict[str, Any]:
+    def catalog_status(self, space_id: Optional[str] = None) -> Dict[str, Any]:
         if not self.cache:
             return {"enabled": False}
-        return self.cache.status(self.namespace)
+        target_space_id = space_id if space_id is not None else self.workbench_space_id
+        return self.cache.status(self.namespace, space_id=target_space_id)
 
     def catalog_search(self, query: str, space_id: Optional[str] = None, node_type: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
         if not self.cache:
-            return {"matches": [], "source": "disabled"}
+            return self._cache_disabled_error(space_id)
         try:
-            return {"matches": self.cache.search(self.namespace, query, space_id=space_id, node_type=node_type, limit=limit), "source": "cache"}
+            ready_search = self.cache.search_ready(self.namespace, query, space_id=space_id, node_type=node_type, limit=limit)
+            if not ready_search.get("ready"):
+                return {"error": ready_search["error"], "source": "cache"}
+            return {
+                "matches": ready_search["matches"],
+                "source": "cache",
+                "catalog": ready_search["catalog"],
+            }
         except Exception as exc:
-            return self._wrap_error(exc)
+            return {
+                "error": catalog_readiness_error(
+                    {"catalog_status": "failed", "last_refresh_error": str(exc)},
+                    space_id,
+                ),
+                "source": "cache",
+            }
 
     def catalog_get(self, item_type: str, item_id: str) -> Dict[str, Any]:
         if not self.cache:
-            return {"item": None, "source": "disabled"}
+            return self._cache_disabled_error()
         try:
-            return {"item": self.cache.get_item(self.namespace, item_type, item_id), "source": "cache"}
+            ready_item = self.cache.get_ready_item(self.namespace, item_type, item_id)
+            if not ready_item.get("ready"):
+                return {"error": ready_item["error"], "source": "cache"}
+            return {"item": ready_item["item"], "source": "cache", "catalog": ready_item["catalog"]}
         except Exception as exc:
-            return self._wrap_error(exc)
+            return {
+                "error": catalog_readiness_error(
+                    {"catalog_status": "failed", "last_refresh_error": str(exc)},
+                    None,
+                ),
+                "source": "cache",
+            }
 
     def catalog_clear(self, space_id: Optional[str] = None) -> Dict[str, Any]:
         if not self.cache:
@@ -781,7 +1189,14 @@ async def vika_spaces_list(args: Dict[str, Any], services: RuntimeServices) -> A
 
 async def vika_nodes_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.nodes_list(args["space_id"], args.get("use_cache", True), args.get("force_refresh", False)))
+    return _raise_if_error(
+        await _CLIENT.nodes_list(
+            args["space_id"],
+            args.get("use_cache", True),
+            args.get("force_refresh", False),
+            args.get("cache_only", False),
+        )
+    )
 
 
 async def vika_nodes_search(args: Dict[str, Any], services: RuntimeServices) -> Any:
@@ -853,7 +1268,7 @@ async def vika_nodes_embedlinks_delete(args: Dict[str, Any], services: RuntimeSe
 
 async def vika_catalog_refresh(args: Dict[str, Any], services: RuntimeServices) -> Any:
     assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.catalog_refresh(args.get("space_id"), args.get("include_fields", False), args.get("include_views", False), args.get("force", False)))
+    return await _CLIENT.catalog_refresh(args.get("space_id"), args.get("include_fields", False), args.get("include_views", False), args.get("force", False))
 
 
 async def vika_catalog_status(args: Dict[str, Any], services: RuntimeServices) -> Any:
@@ -1136,17 +1551,16 @@ def _risk_for_tool(name: str) -> str:
 
 def _aliases_for_tool(name: str, tags: Optional[List[str]]) -> List[str]:
     aliases = list(tags or [])
-    if ".catalog." in name or ".nodes." in name:
-        aliases.extend(["查找", "搜索", "定位", "表", "目录"])
-    if ".schema." in name or ".fields." in name or ".views." in name:
-        aliases.extend(["字段", "列", "表头", "视图", "schema"])
-    if ".records.query" in name or ".records.get" in name:
-        aliases.extend(["查询", "记录", "样本", "筛选"])
-    if ".records.read_all" in name or name == "vika_export_records":
-        aliases.extend(["导出", "全量", "批量读取"])
-    if name in WRITE_TOOLS:
-        aliases.extend(["新增", "写入", "创建", "更新", "修改", "删除"])
+    capability = TOOL_CAPABILITIES.get(name) or {}
+    aliases.extend(capability.get("aliases") or [])
     return sorted(set(aliases))
+
+
+def _capability_for_tool(name: str) -> Dict[str, Any]:
+    return TOOL_CAPABILITIES.get(
+        name,
+        {"capability": name, "aliases": [], "priority": 100},
+    )
 
 
 def _result_policy_for_tool(name: str) -> Dict[str, Any]:
@@ -1155,6 +1569,112 @@ def _result_policy_for_tool(name: str) -> Dict[str, Any]:
     if ".records.query" in name:
         return {"mode": "inline", "default_page_size": 50, "max_page_size": 100, "max_chars": 20000}
     return {"mode": "inline", "max_chars": 20000}
+
+
+def _example_value(name: str, schema: Optional[Dict[str, Any]]) -> Any:
+    if name == "datasheet_id":
+        return "dstExample"
+    if name == "space_id":
+        return "spcExample"
+    if name == "folder_id":
+        return "fodExample"
+    if name == "node_id":
+        return "fodExample"
+    if name == "record_ids":
+        return ["recExample"]
+    if name == "operation_id":
+        return "op_example"
+    if name == "confirmed_payload_hash":
+        return "sha256:example-preview-payload-hash"
+    if name == "confirmed_by_user":
+        return True
+    if name == "max_records":
+        return 1000
+    if name == "page_size":
+        return 50
+    if name == "field_key":
+        return "name"
+    if name == "name":
+        return "客户跟进表"
+    if name == "field_type":
+        return "SingleText"
+    if name == "field_id_or_name":
+        return "客户名称"
+    if name == "view_id_or_name":
+        return "默认视图"
+    if name == "file_path":
+        return "D:/AboutDEV/example.pdf"
+    if name == "url":
+        return "https://example.com/file.pdf"
+    if name == "format":
+        return "csv"
+
+    value_type = (schema or {}).get("type")
+    if isinstance(value_type, list):
+        value_type = value_type[0]
+    if value_type == "boolean":
+        return True
+    if value_type == "integer":
+        return 1
+    if value_type == "array":
+        return []
+    if value_type == "object":
+        return {}
+    return "example"
+
+
+def _examples_for_tool(name: str, properties: Dict[str, Any], required: Optional[List[str]]) -> List[Dict[str, Any]]:
+    if name == "vika.records.create":
+        return [
+            {
+                "arguments": {
+                    "datasheet_id": "dstExample",
+                    "records": [{"fields": {"客户名称": "Alice", "跟进状态": "待跟进"}}],
+                    "field_key": "name",
+                }
+            }
+        ]
+    if name == "vika.records.update":
+        return [
+            {
+                "arguments": {
+                    "datasheet_id": "dstExample",
+                    "records": [{"recordId": "recExample", "fields": {"客户名称": "Alice", "跟进状态": "已联系"}}],
+                    "field_key": "name",
+                }
+            }
+        ]
+    if name == "vika.records.delete":
+        return [{"arguments": {"datasheet_id": "dstExample", "record_ids": ["recExample"]}}]
+    if name == "vika.write.commit":
+        return [
+            {
+                "arguments": {
+                    "operation_id": "op_example",
+                    "confirmed_payload_hash": "sha256:example-preview-payload-hash",
+                    "confirmed_by_user": True,
+                    "user_confirmation_summary": "用户确认向《客户跟进表》新增 1 条客户记录。",
+                }
+            }
+        ]
+    if name == "vika.datasheets.create":
+        return [
+            {
+                "arguments": {
+                    "space_id": "spcExample",
+                    "folder_id": "fodExample",
+                    "name": "客户跟进表",
+                    "description": "客户跟进记录",
+                }
+            }
+        ]
+    if name == "vika.records.query":
+        return [{"arguments": {"datasheet_id": "dstExample", "page_size": 50, "field_key": "name"}}]
+    if name == "vika_export_records":
+        return [{"arguments": {"datasheet_id": "dstExample", "max_records": 1000, "format": "csv"}}]
+
+    example_keys = required or list(properties.keys())[:3]
+    return [{"arguments": {key: _example_value(key, properties.get(key)) for key in example_keys}}]
 
 
 def _register(
@@ -1173,12 +1693,13 @@ def _register(
     runtime_services = services or RuntimeServices()
     domain = _domain_for_tool(name)
     risk = _risk_for_tool(name)
+    capability = _capability_for_tool(name)
     spec = ToolDefinition(
         name=name,
         description=description,
         input_schema=_schema(properties, required),
         output_schema=output_schema or {"type": "object", "additionalProperties": True},
-        examples=[{"arguments": {key: f"{key}_value" for key in (required or [])}}],
+        examples=_examples_for_tool(name, properties, required),
         available=_CLIENT.configured if available is None else available,
         unavailable_reason=None if (available is True or _CLIENT.configured) else "astral_vika not configured",
         tags=tags or ["vika"],
@@ -1187,10 +1708,18 @@ def _register(
         exposure="hidden",
         result_policy=_result_policy_for_tool(name),
         aliases=_aliases_for_tool(name, tags),
+        capability_id=capability.get("capability") or name,
+        capability_aliases=capability.get("aliases") or [],
+        capability_priority=int(capability.get("priority") or 100),
         annotations={
             "readOnlyHint": name not in WRITE_TOOLS,
             "destructiveHint": ".delete" in name or name.endswith(".clear"),
             "idempotentHint": name not in WRITE_TOOLS,
+            "capability": {
+                "id": capability.get("capability") or name,
+                "aliases": capability.get("aliases") or [],
+                "priority": int(capability.get("priority") or 100),
+            },
         },
         read_only=name not in WRITE_TOOLS,
         write=name in WRITE_TOOLS,
@@ -1205,7 +1734,13 @@ def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeSe
     cfg = load_config()
     ttl_hours = getattr(cfg.cache, "ttl_hours", None) or getattr(cfg.vika, "cache_duration_hours", 24)
     cache = CatalogCache(db_path=cfg.cache.db_path, ttl_hours=ttl_hours, enabled=cfg.cache.enabled)
-    _CLIENT = VikaClient(api_token=cfg.vika.api_token, host=cfg.vika.host, default_space_id=cfg.vika.default_space_id, cache=cache)
+    _CLIENT = VikaClient(
+        api_token=cfg.vika.api_token,
+        host=cfg.vika.host,
+        default_space_id=cfg.vika.default_space_id,
+        workbench_space_id=getattr(cfg.vika, "workbench_space_id", None),
+        cache=cache,
+    )
     runtime_services = services or RuntimeServices()
 
     def register(
@@ -1243,7 +1778,14 @@ def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeSe
     registered += register("vika.status", "返回 MCP 的 Vika 配置状态，不做真实网络请求。", vika_status, {}, available=True)
     registered += register("vika.healthcheck", "真实请求 Vika API，检查配置和网络/API 可达性。", vika_healthcheck, {}, available=True)
     registered += register("vika.spaces.list", "列出可访问空间，支持缓存。", vika_spaces_list, {"use_cache": bool_prop, "force_refresh": bool_prop})
-    registered += register("vika.nodes.list", "列出指定空间站节点，支持缓存。", vika_nodes_list, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
+    registered += register(
+        "vika.nodes.list",
+        "列出指定空间站节点，支持缓存；cache_only=true 时缓存缺失或过期会返回 catalog 状态错误，不回退 API。",
+        vika_nodes_list,
+        {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop, "cache_only": bool_prop},
+        ["space_id"],
+        ["vika", "nodes"],
+    )
     registered += register("vika.nodes.search", "按名称、类型或权限搜索节点，优先使用缓存。", vika_nodes_search, {"space_id": str_prop, "query": str_prop, "node_type": str_prop, "permissions": {"type": ["integer", "string", "array"]}, "use_cache": bool_prop, "force_refresh": bool_prop, "limit": int_prop}, ["space_id"], ["vika", "nodes"])
     registered += register("vika.nodes.tree", "返回指定空间的文件夹/节点树。", vika_nodes_tree, {"space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["space_id"], ["vika", "nodes"])
     registered += register("vika.nodes.get", "获取指定节点详情。", vika_nodes_get, {"space_id": str_prop, "node_id": str_prop, "use_cache": bool_prop}, ["space_id", "node_id"], ["vika", "nodes"])
@@ -1252,9 +1794,23 @@ def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeSe
     registered += register("vika.nodes.embedlinks.delete", "删除节点嵌入链接 preview，不直接执行；执行必须走 vika.write.commit。", vika_nodes_embedlinks_delete, _with_safety({"space_id": str_prop, "node_id": str_prop, "link_id": str_prop}), ["space_id", "node_id", "link_id"], ["vika", "nodes"])
 
     registered += register("vika.catalog.refresh", "刷新 SQLite catalog 缓存，可选拉取字段和视图。", vika_catalog_refresh, {"space_id": str_prop, "include_fields": bool_prop, "include_views": bool_prop, "force": bool_prop}, tags=["vika", "catalog"])
-    registered += register("vika.catalog.status", "返回 catalog 缓存状态。", vika_catalog_status, {}, tags=["vika", "catalog"])
-    registered += register("vika.catalog.search", "确定性检索缓存中的表格/节点候选。", vika_catalog_search, {"query": str_prop, "space_id": str_prop, "node_type": str_prop, "limit": int_prop}, ["query"], ["vika", "catalog"])
-    registered += register("vika.catalog.get", "按缓存 item_type 和 item_id 获取 catalog 项。", vika_catalog_get, {"item_type": {"type": "string", "enum": ["space", "node", "datasheet", "field", "view"]}, "item_id": str_prop}, ["item_type", "item_id"], ["vika", "catalog"])
+    registered += register("vika.catalog.status", "返回 catalog 维护诊断状态，并单独给出 ready_for_discovery/discovery_status；模型发现以 discovery readiness 为准。", vika_catalog_status, {}, tags=["vika", "catalog"])
+    registered += register(
+        "vika.catalog.search",
+        "确定性检索缓存中的表格/节点候选；只在统一 selector readiness gate 为 ready 时返回 matches，namespace 检索遇到任一 scoped refresh 非 ready 会返回 catalog error。",
+        vika_catalog_search,
+        {"query": str_prop, "space_id": str_prop, "node_type": str_prop, "limit": int_prop},
+        ["query"],
+        ["vika", "catalog"],
+    )
+    registered += register(
+        "vika.catalog.get",
+        "按缓存 item_type 和 item_id 获取 catalog 项；只在统一 selector readiness gate 为 ready 时返回 item，field/view 使用 datasheet selector 校验。",
+        vika_catalog_get,
+        {"item_type": {"type": "string", "enum": ["space", "node", "datasheet", "field", "view"]}, "item_id": str_prop},
+        ["item_type", "item_id"],
+        ["vika", "catalog"],
+    )
     registered += register("vika.catalog.clear", "清理当前 token namespace 的 catalog 缓存。", vika_catalog_clear, {"space_id": str_prop}, tags=["vika", "catalog"])
     registered += register("vika.schema.get", "获取数据表字段和视图 schema，优先读缓存。", vika_schema_get, {"datasheet_id": str_prop, "space_id": str_prop, "use_cache": bool_prop, "force_refresh": bool_prop}, ["datasheet_id"], ["vika", "schema"])
 

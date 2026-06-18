@@ -34,7 +34,6 @@ class VikaConfig(BaseModel):
     default_space_id: Optional[str] = None
     workbench_url: Optional[str] = None
     workbench_space_id: Optional[str] = None
-    auto_sync_on_startup: bool = True
     cache_duration_hours: int = 24
 
 
