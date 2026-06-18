@@ -100,8 +100,8 @@ vika_mcp 应复制产品模式, 不复制全部复杂度:
 
 | JSHookMCP 模式 | vika_mcp 采用方式 |
 | --- | --- |
-| `search_tools` | `vika_search_tools`, 检索隐藏业务工具和工作流 |
-| `route_tool` | `vika_route_task`, 给自然语言任务返回步骤 |
+| `search_tools` | `vika_search_tools`, 只按 domain/capability/能力关键词检索隐藏工具 |
+| `route_tool` | `vika_route_task`, 只接收结构化 `task_kind` 和 LLM 已抽取的表目标, 返回 workflow 步骤 |
 | `describe_tool` | `vika_describe_tool`, 返回 schema, 示例, 风险, 数据量策略 |
 | `call_tool` | `vika_call_tool`, 直接执行隐藏 registry 中的工具 |
 | `activate_domain` | `vika_activate_domain`, 只设置会话 domain scope, 不动态注册业务工具, 不提升真实写权限 |
@@ -180,8 +180,8 @@ VikaClient / astral_vika
 | --- | --- |
 | `vika_guide` | 返回短操作手册和必须遵守的流程 |
 | `vika_resolve_datasheet` | 从 ID, URL, 表名, 空间名, 路径, 自然语言描述定位表 |
-| `vika_search_tools` | 按任务关键词检索隐藏工具 |
-| `vika_route_task` | 给自然语言任务返回推荐步骤和下一步 |
+| `vika_search_tools` | capability-only hidden tool search; 不解析用户业务自然语言 |
+| `vika_route_task` | 结构化 workflow planner; 输入是 `task_kind` / `datasheet_query` / `datasheet_id` |
 | `vika_describe_tool` | 返回隐藏工具的 schema, 示例, 风险, 输出策略 |
 | `vika_call_tool` | 调用隐藏 registry 中的工具 |
 | `vika_list_domains` | 列出 domain, 风险和默认可见策略 |
@@ -200,18 +200,18 @@ Domain 按任务语义、风险和数据体量划分, 不按 SDK 前缀划分.
 | Domain | 典型能力 | 默认可见 | 自动执行 |
 | --- | --- | --- | --- |
 | `connection` | status, healthcheck, spaces list | hidden, route/call_tool 访问 | 只读可执行 |
-| `discovery` | catalog, nodes, resolve datasheet | `vika_resolve_datasheet` 可见, 其余 hidden | 只读可执行 |
+| `discovery` | cache-only catalog, resolve datasheet | `vika_resolve_datasheet` 可见, cache readers 可由元工具引导 | 只读可执行, 不触发 refresh |
 | `schema` | schema, fields.get, views.get | hidden, route/call_tool 访问 | 只读可执行, 受大小限制 |
 | `query` | 小样本记录查询, records.get | hidden, 由 call_tool 调用 | 只读可执行, 强上限 |
 | `export` | records export, artifact manifest | hidden, route 后调用 | 只读可执行, 返回 artifact |
 | `write` | records/fields/datasheets/attachments create/update/delete | hidden | 只能 preview, commit 需确认 |
-| `admin` | cache clear, 维护诊断 | hidden | 默认不自动 |
+| `admin` | catalog refresh/clear, 维护诊断 | hidden maintenance surface | 不暴露给普通 LLM |
 
 注意:
 
 - `records.query` 和 `records.delete` 不能因为同属 `records` 前缀就放进同一个安全域.
 - `activate_domain(write)` 不能打开真实写权限, 也不能让 write 业务工具出现在 MCP `list_tools` 中.
-- `admin` 不能被自然语言搜索轻易误触发 destructive 操作.
+- `admin` 不能被自然语言搜索、describe 或 call_tool 误触发; catalog refresh/clear 只属于维护面.
 
 ## 9. 指定表定位主路径
 
@@ -227,12 +227,24 @@ Domain 按任务语义、风险和数据体量划分, 不按 SDK 前缀划分.
 - `VIKAMCP_VIKA__WORKBENCH_URL`: 目标 workbench URL. 当前目标为 `https://vika.cn/workbench/fod6mElQf7PFD`.
 - `VIKAMCP_VIKA__WORKBENCH_SPACE_ID`: folder workbench 所在 space id. folder URL 必须提供该值; 禁止通过遍历 token 可见空间来推断.
 
-`vika_resolve_datasheet`, catalog refresh, schema, query, export, write 都必须受该 workbench scope 约束:
+`vika_resolve_datasheet`, cache-only catalog readers, schema, query, export, write 都必须受该 workbench scope 约束:
 
 - 有 URL/ID 输入时, 必须校验目标是否属于配置的 workbench scope.
 - 无 `space_id` 时, 只能在配置 workbench scope 内发现候选.
 - 不得因为 token 可访问其他空间, 就跨出配置 workbench scope 探索.
 - 集成测试也使用同一个 workbench scope.
+- 普通模型交互路径只能读持久化 catalog/cache; catalog 缺失、过期、刷新中、refresh_abandoned 或失败时返回明确状态, 不主动刷新.
+- `vika.catalog.status` 是维护诊断入口, 必须单独返回 `health_status`, `ready_for_discovery`, `discovery_status`, `discovery_error`; `ready_for_discovery/discovery_error` 必须和同 scope 的 discovery/search selector gate 同源, 不能另算一套 status 口径.
+- `vika.catalog.search/get` 只消费统一 selector readiness gate; selector 内任意返回行 timestamp 缺失、非法、`<=0` 或过期时, 不得返回 matches/item.
+- namespace-wide `vika.catalog.search/get` 必须按完整可信结果处理: 只要 namespace 内存在 scoped refresh state 为 `failed`/`refreshing`/`refresh_abandoned`, 或候选行所属 space 的 scoped state 非 ready, 就返回结构化 catalog error, 不得混合返回其它 ready space 的旧内容. 需要局部结果时必须传更窄的 `space_id` 或等待维护刷新完成.
+- 工具层、scope 层、resolver 层不得直接解释 raw `catalog_status`/refresh state 来决定是否返回 catalog 内容; 只能消费 cache 层统一 gate 的 ready/error 结果. WorkbenchScope 只能接受 canonical ready: `ready_for_discovery=true`, `catalog_status=ready`, 且存在的 `readiness_status/discovery_status` 均为 `ready`.
+- catalog refresh/clear 是维护操作, 不通过 `vika_search_tools` / `vika_describe_tool` / `vika_call_tool` 暴露给普通 LLM.
+- catalog refresh 仍必须有明确边界: 目标解析顺序为显式 `space_id` > `VIKAMCP_VIKA__WORKBENCH_SPACE_ID` > `VIKAMCP_VIKA__DEFAULT_SPACE_ID`; 仍缺失时返回 `catalog_refresh_scope_required`, 禁止调用 token-wide `spaces.list`.
+- 显式 space refresh 只能刷新该 space, 不得预先列出 token 可见的所有 space.
+- refresh lifecycle state 必须按 `(namespace, space_id)` 存储和读取; `spcB` 的 failed/refreshing/refresh_abandoned 不得污染 ready `spcA` 的 `ready_for_discovery` 或 cache-only discovery.
+- `catalog_clear(space_id=...)` 只能清理该 space 的 rows 和 refresh state; 只有 full namespace clear 才能清理全部 refresh state.
+- Folder/Datasheet typed refresh 是 node index 的必要成功门槛; required 请求失败时必须标记 refresh failed, 保留旧 cache, 不得用空/部分结果覆盖旧 cache.
+- 显式请求 fields/views refresh 时, schema 子任务失败必须进入返回体和 `last_refresh_error`, 不得伪装为 ready.
 
 输入线索:
 
@@ -443,37 +455,49 @@ Execute a hidden Vika tool by name after vika_describe_tool. Use this instead of
 
 第一版使用可解释检索, 不做向量.
 
+检索架构原则:
+
+- LLM 负责理解用户自然语言、判断操作类型、抽取业务表名或业务对象.
+- MCP 只负责工具能力检索, 不维护业务名词词典, 不从用户自然语言中生成业务对象.
+- `vika_search_tools` 是 capability-only search. 输入应使用 `domain`, `capability`, 或稳定 capability keyword.
+- 纯业务词或自然语言用户任务, 例如 `<业务表名>`, `查询<业务表名>`, `导出<业务表名>`, 必须返回空候选和 guidance, 提示 LLM 先调用 `vika_resolve_datasheet(query=...)`.
+- `TOOL_CAPABILITIES` 只包含稳定能力 id 和能力别名, 不包含客户、订单、设备、案件、工单等业务词.
+
 索引字段:
 
 - tool name
 - domain
 - tags
-- aliases
-- description
+- capability id
+- stable capability aliases
 - schema property names
-- 中文操作词
-- 场景词
 
-中文 alias 必须覆盖:
+稳定 capability alias 可覆盖:
 
-- 查找/搜索/定位 -> discovery/query
-- 字段/列/表头 -> schema
-- 视图 -> schema/query
-- 导出/全量/批量读取 -> export
-- 新增/写入/创建 -> write preview
-- 更新/修改 -> write preview
-- 删除 -> write preview high risk
+- `records.query` / `records export` / `records.update`
+- `查询记录` / `导出记录` / `更新记录`
+- `schema.get` / `fields.get` / `views.get`
+- `write.commit` / `提交写入`
 
 `vika_search_tools` 返回小结果:
 
 - top_k 默认 5, 硬上限 10.
-- 每个候选只返回 name, domain, brief, risk, active/hidden, next_step.
+- 每个候选只返回 name, domain, capability, brief, risk, active/hidden, next_step.
 - 不返回完整 schema; schema 由 `vika_describe_tool` 返回.
+- 不返回 MCP 推断出的业务对象字段.
+- `vika_search_tools(domain="query", capability="records.query")` 命中 `vika.records.query`.
+- `vika_search_tools(query="records query")` 命中 `vika.records.query`.
+- `vika_search_tools(query="查询<业务表名>")` 不命中记录工具, 返回 capability-only guidance.
 
-`vika_route_task` 返回步骤:
+`vika_route_task` 返回步骤和工具候选:
 
-- 适合自然语言任务.
+- 适合 LLM 已理解后的结构化任务, 不接受自由文本 `task`.
+- `task_kind` 必填, 可选 `datasheet_query` / `datasheet_id` / `has_user_confirmation`.
 - 必须给出 recommended sequence.
+- 必须给出 `recommended_tools`, 包含具体 hidden tool、domain、role 和 next_step.
+- 对表级任务, 如果缺少 `datasheet_query` 和 `datasheet_id`, 返回 `datasheet_target_required`.
+- 如果提供 `datasheet_query`, 必须原样透传到 `vika_resolve_datasheet(query=...)`, 不清洗、不截断、不判断系统词.
+- 如果入参包含旧 `task`, 返回 `unsupported_natural_language_route_input`.
 - 不自动 commit 写操作.
 
 ## 14. 标准 MCP 实现边界
@@ -752,7 +776,10 @@ python -m vika_mcp --transport streamable-http --host 127.0.0.1 --port 8080
 | 官方 SDK 被本地 `mcp/` 遮蔽 | 第一阶段改名, 并加 import 测试 |
 | 模型不知道怎么用元工具 | 三层手册: guide, description, describe_tool |
 | 动态激活后客户端不刷新工具列表 | 主路径使用 `vika_call_tool` |
-| catalog 空导致表定位失败 | `resolve_datasheet` 可受限 refresh, 多候选时问用户 |
+| catalog 空或过期导致表定位失败 | `resolve_datasheet` 返回 catalog 状态和维护刷新引导; 不在模型热路径 refresh |
+| 维护 refresh 未指定 space | 返回 `catalog_refresh_scope_required`, 不调用 token-wide `spaces.list` |
+| refresh 进程异常留下 refreshing | 超时后状态变为 `refresh_abandoned`, 并暴露 last_refresh_error |
+| required node refresh 部分失败 | 标记 failed, 保留旧 cache, 不写入部分/空结果 |
 | 大表结果爆上下文 | query 硬上限 + export artifact |
 | 批量写入确认太繁琐 | 按一次写入计划确认, 不逐条确认 |
 | 写入计划被篡改 | payload hash + TTL + operation_id 校验 |
