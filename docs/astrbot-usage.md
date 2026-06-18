@@ -61,3 +61,30 @@ AstrBot should see only stable meta tools by default:
 
 Business tools such as `vika.records.query` stay hidden and are called through
 `vika_call_tool` after `vika_describe_tool`.
+
+Datasheet discovery reads the persisted catalog only. AstrBot/LLM interactions
+should not trigger a full Vika space-node refresh. If the catalog is empty,
+stale, refreshing, refresh-abandoned, or failed, the MCP returns that state;
+refresh the catalog through the maintenance/admin path before retrying table
+discovery or writes.
+
+Catalog search/get also uses the unified selector readiness gate. It returns
+cached matches/items only when the relevant selector is ready. Namespace-wide
+lookup is strict: scoped refresh failure, active refresh, or abandoned refresh
+blocks content instead of mixing old results from one space with ready results
+from another.
+
+Maintenance refresh must stay bounded to one space. The CLI resolves the target
+as explicit `--space-id`, then `VIKAMCP_VIKA__WORKBENCH_SPACE_ID`, then
+`VIKAMCP_VIKA__DEFAULT_SPACE_ID`. Without one of those values it returns
+`catalog_refresh_scope_required` and does not enumerate token-visible spaces.
+If required Folder/Datasheet indexing fails, the MCP marks refresh health failed
+and keeps the previous cache instead of writing partial results. Table discovery
+must use `ready_for_discovery=true`, not maintenance health alone.
+
+Example maintenance commands:
+
+```powershell
+python -m vika_mcp --catalog-status
+python -m vika_mcp --catalog-refresh --space-id your-workbench-space-id
+```
