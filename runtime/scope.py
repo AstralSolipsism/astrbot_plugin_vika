@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from ..cache import catalog_readiness_error
+
 
 HiddenToolCaller = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
@@ -78,7 +80,10 @@ class WorkbenchScope:
                 details={"space_id": space_id, "workbench_space_id": self.workbench_space_id},
             )
 
-        datasheets = await self.load_datasheets()
+        datasheets_result = await self._load_datasheets_result()
+        if "error" in datasheets_result:
+            return self._catalog_resolve_error(datasheets_result["error"])
+        datasheets = datasheets_result["datasheets"]
         if parsed_id:
             selected = next((item for item in datasheets if item.get("datasheet_id") == parsed_id), None)
             if selected:
@@ -126,7 +131,7 @@ class WorkbenchScope:
             "next_actions": ["Ask the user to choose one candidate, then call vika_resolve_datasheet with its datasheet_id."],
         }
 
-    async def check_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def check_tool_call(self, tool_name: str, arguments: Dict[str, Any], write: bool = False) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
 
@@ -157,6 +162,11 @@ class WorkbenchScope:
         space_error = self._check_space_id(tool_name, arguments)
         if space_error is not None:
             return space_error
+
+        if write:
+            freshness_error = await self._ensure_fresh_catalog(tool_name)
+            if freshness_error is not None:
+                return freshness_error
 
         if tool_name == "vika.datasheets.create":
             return await self._check_datasheet_create(tool_name, arguments)
@@ -190,13 +200,17 @@ class WorkbenchScope:
         return None
 
     async def load_datasheets(self) -> List[Dict[str, Any]]:
+        result = await self._load_datasheets_result()
+        return result.get("datasheets", []) if "error" not in result else []
+
+    async def _load_datasheets_result(self) -> Dict[str, Any]:
         if self._datasheets_cache is not None:
-            return self._datasheets_cache
+            return {"datasheets": self._datasheets_cache}
 
         root_id = self.root_id()
         if not root_id:
             self._datasheets_cache = []
-            return self._datasheets_cache
+            return {"datasheets": self._datasheets_cache}
 
         if root_id.startswith("dst"):
             self._datasheets_cache = [
@@ -209,13 +223,16 @@ class WorkbenchScope:
                     "source": "workbench_scope",
                 }
             ]
-            return self._datasheets_cache
+            return {"datasheets": self._datasheets_cache}
 
         if root_id.startswith("fod") and not self.workbench_space_id:
             self._datasheets_cache = []
-            return self._datasheets_cache
+            return {"datasheets": self._datasheets_cache}
 
-        nodes = await self.load_nodes()
+        nodes_result = await self._load_nodes_result()
+        if "error" in nodes_result:
+            return {"error": nodes_result["error"]}
+        nodes = nodes_result["nodes"]
         by_id = self._nodes_by_id(nodes)
         scoped: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -237,21 +254,90 @@ class WorkbenchScope:
                     }
                 )
         self._datasheets_cache = scoped
-        return self._datasheets_cache
+        return {"datasheets": self._datasheets_cache}
 
     async def load_nodes(self) -> List[Dict[str, Any]]:
+        result = await self._load_nodes_result()
+        return result.get("nodes", []) if "error" not in result else []
+
+    async def _load_nodes_result(self) -> Dict[str, Any]:
         if self._nodes_cache is not None:
-            return self._nodes_cache
+            return {"nodes": self._nodes_cache}
         if not self._hidden_caller or not self.workbench_space_id:
             self._nodes_cache = []
-            return self._nodes_cache
+            return {"nodes": self._nodes_cache}
         result = await self._hidden_caller(
             "vika.nodes.list",
-            {"space_id": self.workbench_space_id, "use_cache": False, "force_refresh": True},
+            {"space_id": self.workbench_space_id, "use_cache": True, "force_refresh": False, "cache_only": True},
         )
+        if isinstance(result, dict) and "error" in result:
+            error = result.get("error")
+            catalog_error = error if isinstance(error, dict) else {"code": "catalog_not_ready", "message": str(error)}
+            self._invalidate_catalog_caches()
+            return {"error": catalog_error}
+        catalog_error = self._catalog_error_from_result(result)
+        if catalog_error is not None:
+            self._invalidate_catalog_caches()
+            return {"error": catalog_error}
         nodes = result.get("nodes", []) if isinstance(result, dict) else []
         self._nodes_cache = nodes if isinstance(nodes, list) else []
-        return self._nodes_cache
+        return {"nodes": self._nodes_cache}
+
+    def _catalog_error_from_result(self, result: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(result, dict):
+            return None
+        catalog = result.get("catalog")
+        if not isinstance(catalog, dict):
+            return {
+                "code": "catalog_not_ready",
+                "message": "The workbench catalog result did not include discovery readiness metadata.",
+                "details": {"space_id": self.workbench_space_id, "catalog_status": "empty"},
+            }
+        if self._catalog_is_canonical_ready(catalog):
+            return None
+        return catalog_readiness_error(catalog, self.workbench_space_id)
+
+    def _catalog_is_canonical_ready(self, catalog: Dict[str, Any]) -> bool:
+        if catalog.get("ready_for_discovery") is not True:
+            return False
+        if catalog.get("catalog_status") != "ready":
+            return False
+        for key in ("readiness_status", "discovery_status"):
+            value = catalog.get(key)
+            if value is not None and value != "ready":
+                return False
+        return True
+
+    def _invalidate_catalog_caches(self) -> None:
+        self._nodes_cache = None
+        self._datasheets_cache = None
+
+    async def _ensure_fresh_catalog(self, tool_name: str) -> Optional[Dict[str, Any]]:
+        root_id = self.root_id()
+        if not root_id or root_id.startswith("dst") or not self.workbench_space_id:
+            return None
+        if not self._hidden_caller:
+            return self._catalog_scope_error(
+                tool_name,
+                {"code": "catalog_not_ready", "message": "The workbench catalog is not ready for write scope validation."},
+            )
+        result = await self._hidden_caller(
+            "vika.nodes.list",
+            {"space_id": self.workbench_space_id, "use_cache": True, "force_refresh": False, "cache_only": True},
+        )
+        if isinstance(result, dict) and "error" in result:
+            error = result.get("error")
+            catalog_error = error if isinstance(error, dict) else {"code": "catalog_not_ready", "message": str(error)}
+            self._invalidate_catalog_caches()
+            return self._catalog_scope_error(tool_name, catalog_error)
+        catalog_error = self._catalog_error_from_result(result)
+        if catalog_error is not None:
+            self._invalidate_catalog_caches()
+            return self._catalog_scope_error(tool_name, catalog_error)
+        nodes = result.get("nodes", []) if isinstance(result, dict) else []
+        self._nodes_cache = nodes if isinstance(nodes, list) else []
+        self._datasheets_cache = None
+        return None
 
     def _remember_datasheet(self, selected: Dict[str, Any]) -> None:
         datasheet_id = selected.get("datasheet_id")
@@ -278,31 +364,41 @@ class WorkbenchScope:
         folder_id = arguments.get("folder_id")
         if not folder_id:
             return self._target_out_error(tool_name, "folder_id", None)
-        if await self._node_in_scope(folder_id):
+        scope_result = await self._node_scope_result(folder_id)
+        if "error" in scope_result:
+            return self._catalog_scope_error(tool_name, scope_result["error"])
+        if scope_result.get("in_scope"):
             return None
         return self._target_out_error(tool_name, "folder_id", folder_id)
 
     async def _check_node_targets(self, tool_name: str, arguments: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         for key in ("node_id", "folder_id"):
             target_id = arguments.get(key)
-            if target_id and not await self._node_in_scope(target_id):
-                return self._target_out_error(tool_name, key, target_id)
+            if target_id:
+                scope_result = await self._node_scope_result(target_id)
+                if "error" in scope_result:
+                    return self._catalog_scope_error(tool_name, scope_result["error"])
+                if not scope_result.get("in_scope"):
+                    return self._target_out_error(tool_name, key, target_id)
         return None
 
-    async def _node_in_scope(self, node_id: str) -> bool:
+    async def _node_scope_result(self, node_id: str) -> Dict[str, Any]:
         root_id = self.root_id()
         if not root_id:
-            return False
+            return {"in_scope": False}
         if node_id == root_id:
-            return True
+            return {"in_scope": True}
         if root_id.startswith("dst"):
-            return node_id == root_id
-        nodes = await self.load_nodes()
+            return {"in_scope": node_id == root_id}
+        nodes_result = await self._load_nodes_result()
+        if "error" in nodes_result:
+            return {"error": nodes_result["error"]}
+        nodes = nodes_result["nodes"]
         by_id = self._nodes_by_id(nodes)
         node = by_id.get(node_id)
         if not node:
-            return False
-        return self._is_descendant_or_self(node, root_id, by_id)
+            return {"in_scope": False}
+        return {"in_scope": self._is_descendant_or_self(node, root_id, by_id)}
 
     def _nodes_by_id(self, nodes: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         return {node.get("id"): node for node in nodes if node.get("id")}
@@ -356,6 +452,18 @@ class WorkbenchScope:
             or ["Choose a target inside the configured workbench scope, then retry vika_resolve_datasheet."],
         }
 
+    def _catalog_resolve_error(self, catalog_error: Dict[str, Any]) -> Dict[str, Any]:
+        return self._resolve_error(
+            code=str(catalog_error.get("code") or "catalog_not_ready"),
+            match_basis="workbench_catalog_unavailable",
+            message=str(catalog_error.get("message") or "The workbench catalog is not ready for cache-only discovery."),
+            details=catalog_error.get("details") if isinstance(catalog_error.get("details"), dict) else None,
+            next_actions=[
+                "Ask an operator to run the catalog refresh maintenance command.",
+                "Retry vika_resolve_datasheet after the catalog diagnostic response reports ready_for_discovery=true.",
+            ],
+        )
+
     def _scope_error(self, tool_name: str, code: str, message: str, match_basis: str) -> Dict[str, Any]:
         return {
             "error": {
@@ -364,6 +472,24 @@ class WorkbenchScope:
                 "details": {
                     "tool_name": tool_name,
                     "match_basis": match_basis,
+                    "workbench_scope": self.workbench_url,
+                },
+            }
+        }
+
+    def _catalog_scope_error(self, tool_name: str, catalog_error: Dict[str, Any]) -> Dict[str, Any]:
+        code = str(catalog_error.get("code") or "catalog_not_ready")
+        details = catalog_error.get("details") if isinstance(catalog_error.get("details"), dict) else {}
+        return {
+            "error": {
+                "code": code,
+                "message": str(
+                    catalog_error.get("message")
+                    or "The workbench catalog is not ready for cache-only scope validation."
+                ),
+                "details": {
+                    **details,
+                    "tool_name": tool_name,
                     "workbench_scope": self.workbench_url,
                 },
             }

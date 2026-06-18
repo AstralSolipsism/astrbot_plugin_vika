@@ -17,6 +17,9 @@ class ToolDefinition(BaseModel):
     exposure: Literal["visible", "hidden"] = "hidden"
     result_policy: Dict[str, Any] = Field(default_factory=lambda: {"mode": "inline"})
     aliases: List[str] = Field(default_factory=list)
+    capability_id: Optional[str] = None
+    capability_aliases: List[str] = Field(default_factory=list)
+    capability_priority: int = 100
     annotations: Dict[str, Any] = Field(default_factory=dict)
     read_only: bool = True
     write: bool = False

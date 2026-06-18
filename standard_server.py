@@ -45,10 +45,17 @@ def create_standard_mcp(
     server = FastMCP(
         "vika_mcp",
         instructions=(
-            "Use vika_guide first when unsure. Resolve datasheets before schema/query. Use export/artifact tools "
-            "for large reads. Writes must preview first; use confirmation_context/confirmation_brief as the factual "
-            "source for one-sentence user confirmation, then commit with operation_id, confirmed_payload_hash, "
-            "and confirmed_by_user=true."
+            "Use vika_guide first when unsure. LLM extracts the business table name or business object from the "
+            "user request and passes it unchanged to vika_resolve_datasheet(query=...). vika_search_tools is "
+            "capability-only; use domain/capability such as records.query, records.export, schema.get, or "
+            "records.update, not user business phrases. vika_route_task is a structured workflow planner: provide "
+            "task_kind plus datasheet_query or datasheet_id, and do not pass free-text user tasks. Resolve "
+            "datasheets before schema/query; discovery is cache-only and must not trigger catalog refresh or live "
+            "space/node enumeration. Catalog content is returned only after the unified discovery/selector "
+            "readiness gate is ready; empty, stale, refreshing, refresh_abandoned, failed, or disabled readiness "
+            "means ask for maintenance instead. Use export/artifact tools for large reads. Writes must preview "
+            "first; use confirmation_context/confirmation_brief as the factual source for one-sentence user "
+            "confirmation, then commit with operation_id, confirmed_payload_hash, and confirmed_by_user=true."
         ),
         host=effective_host,
         port=effective_port,
@@ -113,16 +120,31 @@ def register_meta_tools(server: FastMCP, runtime: MetaToolRuntime) -> None:
         description=definitions["vika_search_tools"].description,
         annotations=_annotations_for(definitions["vika_search_tools"]),
     )
-    async def vika_search_tools(query: str = "", domain: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
-        return await runtime.search_tools(query=query, domain=domain, top_k=top_k)
+    async def vika_search_tools(
+        query: str = "",
+        domain: Optional[str] = None,
+        capability: Optional[str] = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
+        return await runtime.search_tools(query=query, domain=domain, capability=capability, top_k=top_k)
 
     @server.tool(
         name="vika_route_task",
         description=definitions["vika_route_task"].description,
         annotations=_annotations_for(definitions["vika_route_task"]),
     )
-    async def vika_route_task(task: str) -> Dict[str, Any]:
-        return await runtime.route_task(task)
+    async def vika_route_task(
+        task_kind: str,
+        datasheet_query: Optional[str] = None,
+        datasheet_id: Optional[str] = None,
+        has_user_confirmation: bool = False,
+    ) -> Dict[str, Any]:
+        return await runtime.route_task(
+            task_kind=task_kind,
+            datasheet_query=datasheet_query,
+            datasheet_id=datasheet_id,
+            has_user_confirmation=has_user_confirmation,
+        )
 
     @server.tool(
         name="vika_describe_tool",
