@@ -168,6 +168,6 @@ vika_mcp*.local.yaml
 *.sqlite3
 *.sqlite3-journal
 
-# Local checkout of the SDK dependency. The package depends on astral-vika;
-# this source checkout is for offline/development use and keeps its own repo.
-astral_vika/
+# Local checkout of the SDK dependency. The vendored package snapshot lives
+# under vendor/astral_vika and is tracked by this repository.
+/astral_vika/

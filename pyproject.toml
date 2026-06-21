@@ -9,7 +9,6 @@ description = "Universal MCP-style Vika service backed by the astral_vika SDK."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "astral-vika>=1.1.3,<2.0.0",
     "anyio>=4.5.0",
     "httpx>=0.27.1",
     "mcp==1.12.4",
@@ -30,7 +29,14 @@ packages = [
     "vika_mcp",
     "vika_mcp.runtime",
     "vika_mcp.tools",
+    "astral_vika",
+    "astral_vika.datasheet",
+    "astral_vika.node",
+    "astral_vika.space",
+    "astral_vika.types",
+    "astral_vika.unit",
 ]
 
 [tool.setuptools.package-dir]
 "vika_mcp" = "."
+"astral_vika" = "vendor/astral_vika/src/astral_vika"

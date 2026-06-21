@@ -3,11 +3,15 @@
 `vika_mcp` is the MCP-oriented Vika service that supersedes the old
 AstrBot-specific plugin contents in this repository.
 
-The Vika SDK remains a separate package:
+The Vika SDK is vendored into this repository so the project can be installed
+from a single GitHub checkout without relying on PyPI for `astral-vika`:
 
-- Runtime dependency: `astral-vika>=1.1.3,<2.0.0`
+- Runtime import package: `astral_vika`
+- Vendored source snapshot: `vendor/astral_vika/src/astral_vika`
 - Local development checkout: `astral_vika/` may exist beside this package, but
-  it is ignored by this repository and keeps its own release lifecycle.
+  it is ignored by this repository and is not used for packaging. Set
+  `VIKAMCP_USE_LOCAL_ASTRAL_VIKA=1` only when deliberately testing that local
+  checkout instead of the vendored snapshot.
 
 ## Run
 
