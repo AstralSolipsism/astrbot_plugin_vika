@@ -56,6 +56,35 @@ The model sees stable meta tools first: guide, resolve, search, route, describe,
 call, domain controls, and artifact readers. Business Vika tools stay hidden and
 are invoked through `vika_call_tool` after `vika_describe_tool`.
 
+## Configuration
+
+If `--config` or `VIKAMCP_CONFIG` points to a missing, malformed, or non-object
+YAML file, startup fails. If no explicit path is provided and the default
+`vika_mcp.yaml` file is absent, the service starts from defaults plus
+environment overrides.
+
+Registry switches are honored at startup:
+
+- `registry.enable_vika_tools=false` skips Vika tool registration.
+- `registry.enable_builtin=true` registers builtin tools such as `time.now`.
+- `registry.enabled_toolsets` can whitelist `vika` and/or `builtin`.
+
+Attachment download host allowlist:
+
+```powershell
+$env:VIKAMCP_VIKA__ATTACHMENT_DOWNLOAD_ALLOWED_HOSTS="files.vika.cn,cdn.example.com"
+```
+
+`vika.attachments.download` always allows the configured `vika.host` and the
+extra hosts above. It does not accept `save_path`; downloads are streamed into a
+service-owned artifact and return `artifact_id`, manifest fields, byte count,
+content type, filename, and `next_actions=["vika_artifact_status"]`.
+
+`vika.attachments.upload` intentionally keeps arbitrary local `file_path`
+support. Preview reports `file_path`, `file_name`, `file_size_bytes`, and
+`file_sha256`; commit recalculates the file hash and rejects the upload with
+`file_hash_mismatch` if the file changed after preview.
+
 Datasheet discovery is cache-first and cache-only on the model path. Large
 workspace catalog refresh is a maintenance operation; normal `stdio` or
 Streamable HTTP model requests must not trigger a full space scan. If the

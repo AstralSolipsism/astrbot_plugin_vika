@@ -28,6 +28,8 @@ Rules:
 - Write previews require fresh catalog scope evidence; missing or stale catalog state blocks writes.
 - `vika_export_records` requires `max_records`; use a filter/formula and bounded CSV export, then inspect with artifact tools or let an execution agent analyze the CSV with pandas.
 - Write tools only preview; commit requires `operation_id`, `confirmed_payload_hash`, and `confirmed_by_user=true`.
+- `vika.attachments.upload` accepts any local `file_path`, but preview must show the file path, name, size, and SHA-256 before commit.
+- `vika.attachments.download` accepts only `url`; it never accepts `save_path` and returns a binary artifact reference instead of writing to an arbitrary path.
 - Do not guess a `datasheet_id`.
 - Do not call `vika.records.read_all` directly; it is an internal export detail.
 - Do not expect MCP `list_tools` to expose business tools.

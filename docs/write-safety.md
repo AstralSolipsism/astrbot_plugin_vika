@@ -31,6 +31,19 @@ Commit requires:
 
 The service rejects missing user confirmation, missing or mismatched payload hash, expired operations, and mutated stored payloads. Repeated commits return `already_committed` with the original result.
 
+Attachment upload keeps arbitrary local `file_path` support. It does not impose
+an artifact-root or workspace path restriction. Preview records and exposes the
+file facts needed for confirmation:
+
+- `file_path`
+- `file_name`
+- `file_size_bytes`
+- `file_sha256`
+
+Commit recalculates size and SHA-256 before calling Vika. If the file was
+replaced or modified after preview, commit returns `file_hash_mismatch` and does
+not upload.
+
 Direct MCP write payload limits:
 
 - max 500 records
