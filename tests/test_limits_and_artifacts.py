@@ -134,6 +134,34 @@ def test_attachment_download_schema_requires_url() -> None:
 
     assert spec.input_schema["required"] == ["url"]
     assert "attachment" not in spec.input_schema["properties"]
+    assert "save_path" not in spec.input_schema["properties"]
+
+
+def test_artifact_store_creates_binary_download_manifest_without_inline_content(tmp_path: Path) -> None:
+    from vika_mcp.runtime.artifacts import ArtifactStore
+
+    store = ArtifactStore(tmp_path)
+    created = store.create_download_artifact(
+        filename="report.pdf",
+        source_url="https://vika.cn/attachments/report.pdf",
+        content_type="application/pdf",
+        content=b"abc",
+    )
+
+    assert created["artifact_id"].startswith("dl_")
+    assert created["format"] == "binary"
+    assert created["filename"] == "report.pdf"
+    assert created["byte_count"] == 3
+    assert created["content_inline"] is False
+    assert created["next_actions"] == ["vika_artifact_status"]
+    assert Path(created["path"]).is_file()
+
+    manifest = store.status(created["artifact_id"])
+    assert manifest["source_url_hash"]
+    assert "source_url" not in manifest
+
+    with pytest.raises(ValueError, match="not line-readable"):
+        store.read(created["artifact_id"])
 
 
 def test_artifact_store_writes_csv_by_default_for_tabular_analysis(tmp_path: Path) -> None:
@@ -201,7 +229,6 @@ async def test_export_records_uses_runtime_artifact_store(tmp_path, monkeypatch)
     from vika_mcp.runtime.build_registry import build_hidden_registry
     from vika_mcp.runtime.meta_tools import MetaToolRuntime
     from vika_mcp.runtime.services import RuntimeServices
-    from vika_mcp.tools import vika_tools
 
     class FakeClient:
         configured = True
@@ -210,19 +237,14 @@ async def test_export_records_uses_runtime_artifact_store(tmp_path, monkeypatch)
             return {"records": [{"id": "rec1", "fields": {"name": "Alice"}}]}
 
     services = RuntimeServices(artifact_store=ArtifactStore(tmp_path))
-    old_client = vika_tools._CLIENT
-    try:
-        registry = build_hidden_registry(services=services)
-        vika_tools._CLIENT = FakeClient()
-        runtime = MetaToolRuntime(registry, artifact_store=services.artifact_store)
-        exported = await runtime.call_tool("vika_export_records", {"datasheet_id": "dst123", "max_records": 1})
-        read = await runtime.artifact_read(exported["artifact_id"], start_line=1, lines=2)
+    registry = build_hidden_registry(services=services, vika_client=FakeClient())
+    runtime = MetaToolRuntime(registry, artifact_store=services.artifact_store)
+    exported = await runtime.call_tool("vika_export_records", {"datasheet_id": "dst123", "max_records": 1})
+    read = await runtime.artifact_read(exported["artifact_id"], start_line=1, lines=2)
 
-        assert exported["format"] == "csv"
-        assert exported["path"].endswith(".csv")
-        assert read["returned_lines"] == 2
-        assert read["lines"][0] == "record_id,name"
-        assert read["lines"][1] == "rec1,Alice"
-        assert str(tmp_path) in exported["path"]
-    finally:
-        vika_tools._CLIENT = old_client
+    assert exported["format"] == "csv"
+    assert exported["path"].endswith(".csv")
+    assert read["returned_lines"] == 2
+    assert read["lines"][0] == "record_id,name"
+    assert read["lines"][1] == "rec1,Alice"
+    assert str(tmp_path) in exported["path"]

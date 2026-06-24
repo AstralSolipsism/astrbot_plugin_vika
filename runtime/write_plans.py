@@ -32,6 +32,8 @@ class WritePlanStore:
         record_count: int,
         execute: ExecuteWrite,
         risk_level: Optional[str] = None,
+        confirmation_details: Optional[Dict[str, Any]] = None,
+        confirmation_brief_suffix: Optional[str] = None,
     ) -> Dict[str, Any]:
         stored_payload = copy.deepcopy(payload)
         payload_bytes = self._payload_bytes(stored_payload)
@@ -64,6 +66,7 @@ class WritePlanStore:
             payload_hash=payload_hash,
             expires_at=expires_at.isoformat(),
             operation_label=operation_label,
+            confirmation_details=confirmation_details,
         )
         public_operation = {
             "operation_id": operation_id,
@@ -82,6 +85,7 @@ class WritePlanStore:
                 record_count=record_count,
                 item_label=item_label,
                 risk_level=risk_level,
+                suffix=confirmation_brief_suffix,
             ),
             "ask_user_instruction": self._ask_user_instruction(payload_hash),
             "preview_only": True,
@@ -206,8 +210,9 @@ class WritePlanStore:
         payload_hash: str,
         expires_at: str,
         operation_label: str,
+        confirmation_details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return {
+        context = {
             "operation_id": operation_id,
             "operation_type": operation_type,
             "target_label": target_label,
@@ -217,6 +222,9 @@ class WritePlanStore:
             "expires_at": expires_at,
             "operation_label": operation_label,
         }
+        if confirmation_details:
+            context.update(copy.deepcopy(confirmation_details))
+        return context
 
     def _confirmation_brief(
         self,
@@ -225,8 +233,12 @@ class WritePlanStore:
         record_count: int,
         item_label: str,
         risk_level: str,
+        suffix: Optional[str] = None,
     ) -> str:
-        return f"将对《{target_label}》{operation_label} {record_count} {item_label}，风险等级 {risk_level}。"
+        brief = f"将对《{target_label}》{operation_label} {record_count} {item_label}，风险等级 {risk_level}。"
+        if suffix:
+            brief = f"{brief}{suffix}"
+        return brief
 
     def _ask_user_instruction(self, payload_hash: str) -> str:
         return (

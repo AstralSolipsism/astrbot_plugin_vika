@@ -2062,9 +2062,7 @@ async def test_hidden_catalog_refresh_returns_scope_error_without_exception(monk
         async def catalog_refresh(self, space_id=None, include_fields=False, include_views=False, force=False):
             return {"error": {"code": "catalog_refresh_scope_required", "message": "bounded scope required"}}
 
-    monkeypatch.setattr(vika_tools, "_CLIENT", FakeClient())
-
-    result = await vika_tools.vika_catalog_refresh({}, RuntimeServices())
+    result = await vika_tools.vika_catalog_refresh({}, RuntimeServices(vika_client=FakeClient()))
 
     assert result["error"]["code"] == "catalog_refresh_scope_required"
 

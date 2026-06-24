@@ -1,10 +1,14 @@
 ﻿import hashlib
 import json
+import mimetypes
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
+from urllib.parse import unquote, urlparse
 
 from ..cache import CatalogCache, catalog_readiness_error
 from ..config import load_config
+from ..runtime.artifacts import ArtifactStore
 from ..runtime.limits import enforce_inline_record_limit, normalize_query_page_size
 from ..runtime.registry import ToolRegistry
 from ..runtime.services import RuntimeServices
@@ -38,6 +42,11 @@ WRITE_TOOLS = {
     "vika.nodes.embedlinks.delete",
     "vika.write.commit",
 }
+
+
+ATTACHMENT_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
+ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30
+STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 TOOL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
@@ -157,12 +166,17 @@ class VikaClient:
         default_space_id: Optional[str] = None,
         workbench_space_id: Optional[str] = None,
         cache: Optional[CatalogCache] = None,
+        attachment_download_allowed_hosts: Optional[List[str]] = None,
     ) -> None:
         self.api_token = api_token
         self.host = (host or DEFAULT_API_BASE or "https://vika.cn").rstrip("/")
         self.default_space_id = default_space_id
         self.workbench_space_id = workbench_space_id
         self.cache = cache
+        self.attachment_download_allowed_hosts = self._build_attachment_download_allowed_hosts(
+            self.host,
+            attachment_download_allowed_hosts or [],
+        )
         self._last_node_refresh_requests: List[Dict[str, Any]] = []
         self._last_node_refresh_required_errors: List[Dict[str, Any]] = []
 
@@ -199,6 +213,91 @@ class VikaClient:
             except Exception:
                 pass
         return field_key if field_key in ("name", "id") else "name"
+
+    def _build_attachment_download_allowed_hosts(self, host: str, extra_hosts: List[str]) -> List[str]:
+        hosts: List[str] = []
+
+        def add(value: Optional[str]) -> None:
+            if not value:
+                return
+            parsed = urlparse(value if "://" in value else f"//{value}")
+            hostname = (parsed.hostname or value).strip().lower().rstrip(".")
+            if hostname:
+                hosts.append(hostname)
+
+        add(host)
+        for item in extra_hosts:
+            add(item)
+        return sorted(set(hosts))
+
+    def _validate_attachment_download_url(self, url: str) -> Optional[Dict[str, Any]]:
+        parsed = urlparse(url or "")
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return {
+                "error": {
+                    "code": "attachment_download_invalid_url",
+                    "message": "attachments.download requires an absolute http(s) URL.",
+                }
+            }
+        hostname = parsed.hostname.strip().lower().rstrip(".")
+        if hostname not in self.attachment_download_allowed_hosts:
+            return {
+                "error": {
+                    "code": "attachment_download_host_not_allowed",
+                    "message": "Attachment download URL host is not allowlisted.",
+                    "details": {
+                        "host": hostname,
+                        "allowed_hosts": self.attachment_download_allowed_hosts,
+                    },
+                }
+            }
+        return None
+
+    def _filename_from_download_response(self, url: str, content_disposition: Optional[str]) -> str:
+        if content_disposition:
+            for part in content_disposition.split(";"):
+                key, separator, value = part.strip().partition("=")
+                if not separator:
+                    continue
+                key = key.lower()
+                value = value.strip().strip('"')
+                if key == "filename*":
+                    _charset, _sep, encoded = value.partition("''")
+                    return unquote(encoded or value)
+                if key == "filename":
+                    return value
+        parsed = urlparse(url)
+        name = Path(unquote(parsed.path or "")).name
+        return name or "download.bin"
+
+    async def _download_url_to_path(self, url: str, path: Path, max_bytes: int) -> Dict[str, Any]:
+        import aiohttp
+
+        timeout = aiohttp.ClientTimeout(total=ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status >= 400:
+                    raise ValueError(f"attachment_download_http_{response.status}")
+                if response.content_length is not None and response.content_length > max_bytes:
+                    raise ValueError("attachment_download_too_large")
+
+                content_type = response.headers.get("Content-Type") or mimetypes.guess_type(urlparse(url).path)[0] or "application/octet-stream"
+                filename = self._filename_from_download_response(url, response.headers.get("Content-Disposition"))
+                byte_count = 0
+                with path.open("wb") as fh:
+                    async for chunk in response.content.iter_chunked(STREAM_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        byte_count += len(chunk)
+                        if byte_count > max_bytes:
+                            raise ValueError("attachment_download_too_large")
+                        fh.write(chunk)
+
+        return {
+            "byte_count": byte_count,
+            "content_type": content_type.split(";", 1)[0].strip() or "application/octet-stream",
+            "filename": filename,
+        }
 
     def _cache_max_age(self) -> Optional[int]:
         return self.cache.ttl_seconds if self.cache and self.cache.enabled else None
@@ -898,19 +997,41 @@ class VikaClient:
             if vika is not None:
                 await vika.aclose()
 
-    async def attachments_download(self, url: Optional[str] = None, attachment: Optional[Dict[str, Any]] = None, save_path: Optional[str] = None) -> Dict[str, Any]:
-        vika = None
+    async def attachments_download(
+        self,
+        url: str,
+        artifact_store: ArtifactStore,
+        max_bytes: int = ATTACHMENT_DOWNLOAD_MAX_BYTES,
+    ) -> Dict[str, Any]:
+        validation_error = self._validate_attachment_download_url(url)
+        if validation_error:
+            return validation_error
+
+        prepared = artifact_store.prepare_download_artifact(
+            filename=self._filename_from_download_response(url, None),
+            source_url=url,
+            content_type=mimetypes.guess_type(urlparse(url).path)[0] or "application/octet-stream",
+        )
+        path = Path(prepared["path"])
         try:
-            if not url and not attachment:
-                raise ValueError("either 'url' or 'attachment' must be provided")
-            vika = self._ensure_client()
-            path = await vika.datasheet("dst_dummy_for_attachment").attachments.adownload(attachment if attachment is not None else (url or ""), save_path)
-            return {"path": path}
+            download = await self._download_url_to_path(url, path, max_bytes)
+            return artifact_store.finish_download_artifact(
+                prepared,
+                byte_count=download["byte_count"],
+                content_type=download.get("content_type"),
+                filename=download.get("filename"),
+            )
         except Exception as exc:
-            return self._wrap_error(exc)
-        finally:
-            if vika is not None:
-                await vika.aclose()
+            if path.exists():
+                path.unlink()
+            code = str(exc) if str(exc).startswith("attachment_download_") else "attachment_download_failed"
+            return {
+                "error": {
+                    "code": code,
+                    "message": str(exc),
+                    "details": {"type": exc.__class__.__name__, "max_bytes": max_bytes},
+                }
+            }
 
     async def datasheets_create(
         self,
@@ -1136,15 +1257,18 @@ class VikaClient:
             return self._wrap_error(exc)
 
 
-_CLIENT: Optional[VikaClient] = None
-
-
 def _raise_if_error(result: Any) -> Any:
     if isinstance(result, dict) and "error" in result:
         raise Exception(json.dumps(result["error"], ensure_ascii=False))
     if isinstance(result, list) and result and isinstance(result[0], dict) and "error" in result[0]:
         raise Exception(json.dumps(result[0]["error"], ensure_ascii=False))
     return result
+
+
+def _client(services: RuntimeServices) -> Any:
+    if services.vika_client is None:
+        raise RuntimeError("Vika client is not registered for this runtime service context.")
+    return services.vika_client
 
 
 def _record_count_from_payload(payload: Dict[str, Any]) -> int:
@@ -1172,25 +1296,82 @@ def _field_names_from_records(records: Any) -> List[str]:
     return sorted(names)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _attachment_upload_file_facts(file_path: str) -> Dict[str, Any]:
+    try:
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            return {
+                "error": {
+                    "code": "file_not_found",
+                    "message": f"Attachment upload file not found: {file_path}",
+                    "details": {"file_path": str(path)},
+                }
+            }
+        stat = path.stat()
+        return {
+            "file_path": str(path),
+            "file_name": path.name,
+            "file_size_bytes": stat.st_size,
+            "file_sha256": _sha256_file(path),
+        }
+    except Exception as exc:
+        return {
+            "error": {
+                "code": "file_metadata_unavailable",
+                "message": str(exc),
+                "details": {"file_path": file_path, "type": exc.__class__.__name__},
+            }
+        }
+
+
+def _attachment_upload_hash_guard(operation: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = operation["payload"]
+    current = _attachment_upload_file_facts(payload["file_path"])
+    if "error" in current:
+        return current
+    if current["file_sha256"] != payload["file_sha256"] or current["file_size_bytes"] != payload["file_size_bytes"]:
+        return {
+            "error": {
+                "code": "file_hash_mismatch",
+                "message": "Attachment file changed after preview; create a new preview before uploading.",
+                "details": {
+                    "file_path": payload["file_path"],
+                    "expected_sha256": payload["file_sha256"],
+                    "actual_sha256": current["file_sha256"],
+                    "expected_size_bytes": payload["file_size_bytes"],
+                    "actual_size_bytes": current["file_size_bytes"],
+                },
+            }
+        }
+    return None
+
+
 async def vika_status(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.status())
+    return _raise_if_error(await _client(services).status())
 
 
 async def vika_healthcheck(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return await _CLIENT.healthcheck()
+    return await _client(services).healthcheck()
 
 
 async def vika_spaces_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.spaces_list(args.get("use_cache", True), args.get("force_refresh", False)))
+    return _raise_if_error(await _client(services).spaces_list(args.get("use_cache", True), args.get("force_refresh", False)))
 
 
 async def vika_nodes_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     return _raise_if_error(
-        await _CLIENT.nodes_list(
+        await _client(services).nodes_list(
             args["space_id"],
             args.get("use_cache", True),
             args.get("force_refresh", False),
@@ -1200,9 +1381,8 @@ async def vika_nodes_list(args: Dict[str, Any], services: RuntimeServices) -> An
 
 
 async def vika_nodes_search(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     return _raise_if_error(
-        await _CLIENT.nodes_search(
+        await _client(services).nodes_search(
             args["space_id"],
             query=args.get("query"),
             node_type=args.get("node_type"),
@@ -1215,22 +1395,18 @@ async def vika_nodes_search(args: Dict[str, Any], services: RuntimeServices) -> 
 
 
 async def vika_nodes_tree(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.nodes_tree(args["space_id"], args.get("use_cache", True), args.get("force_refresh", False)))
+    return _raise_if_error(await _client(services).nodes_tree(args["space_id"], args.get("use_cache", True), args.get("force_refresh", False)))
 
 
 async def vika_nodes_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.nodes_get(args["space_id"], args["node_id"], args.get("use_cache", True)))
+    return _raise_if_error(await _client(services).nodes_get(args["space_id"], args["node_id"], args.get("use_cache", True)))
 
 
 async def vika_nodes_embedlinks_list(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.embedlinks_list(args["space_id"], args["node_id"]))
+    return _raise_if_error(await _client(services).embedlinks_list(args["space_id"], args["node_id"]))
 
 
 async def vika_nodes_embedlinks_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"space_id": args["space_id"], "node_id": args["node_id"], "theme": args.get("theme"), "payload": args.get("payload")}
     return services.write_plans.preview(
         "nodes.embedlinks.create",
@@ -1239,7 +1415,7 @@ async def vika_nodes_embedlinks_create(args: Dict[str, Any], services: RuntimeSe
         payload,
         [],
         1,
-        lambda operation: _CLIENT.embedlinks_create(
+        lambda operation: _client(services).embedlinks_create(
             operation["payload"]["space_id"],
             operation["payload"]["node_id"],
             operation["payload"].get("theme"),
@@ -1249,7 +1425,6 @@ async def vika_nodes_embedlinks_create(args: Dict[str, Any], services: RuntimeSe
 
 
 async def vika_nodes_embedlinks_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"space_id": args["space_id"], "node_id": args["node_id"], "link_id": args["link_id"]}
     return services.write_plans.preview(
         "nodes.embedlinks.delete",
@@ -1258,7 +1433,7 @@ async def vika_nodes_embedlinks_delete(args: Dict[str, Any], services: RuntimeSe
         payload,
         [],
         1,
-        lambda operation: _CLIENT.embedlinks_delete(
+        lambda operation: _client(services).embedlinks_delete(
             operation["payload"]["space_id"],
             operation["payload"]["node_id"],
             operation["payload"]["link_id"],
@@ -1267,39 +1442,32 @@ async def vika_nodes_embedlinks_delete(args: Dict[str, Any], services: RuntimeSe
 
 
 async def vika_catalog_refresh(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return await _CLIENT.catalog_refresh(args.get("space_id"), args.get("include_fields", False), args.get("include_views", False), args.get("force", False))
+    return await _client(services).catalog_refresh(args.get("space_id"), args.get("include_fields", False), args.get("include_views", False), args.get("force", False))
 
 
 async def vika_catalog_status(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _CLIENT.catalog_status()
+    return _client(services).catalog_status()
 
 
 async def vika_catalog_search(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _CLIENT.catalog_search(args.get("query", ""), args.get("space_id"), args.get("node_type"), args.get("limit", 20))
+    return _client(services).catalog_search(args.get("query", ""), args.get("space_id"), args.get("node_type"), args.get("limit", 20))
 
 
 async def vika_catalog_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _CLIENT.catalog_get(args["item_type"], args["item_id"])
+    return _client(services).catalog_get(args["item_type"], args["item_id"])
 
 
 async def vika_catalog_clear(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _CLIENT.catalog_clear(args.get("space_id"))
+    return _client(services).catalog_clear(args.get("space_id"))
 
 
 async def vika_schema_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.schema_get(args["datasheet_id"], args.get("space_id"), args.get("use_cache", True), args.get("force_refresh", False)))
+    return _raise_if_error(await _client(services).schema_get(args["datasheet_id"], args.get("space_id"), args.get("use_cache", True), args.get("force_refresh", False)))
 
 
 async def vika_records_query(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     page_size = normalize_query_page_size(args.get("page_size"))
-    result = _raise_if_error(await _CLIENT.records_query(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), page_size, args.get("page_num"), args.get("page_token"), args.get("sort"), args.get("field_key")))
+    result = _raise_if_error(await _client(services).records_query(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), page_size, args.get("page_num"), args.get("page_token"), args.get("sort"), args.get("field_key")))
     result.update(
         {
             "datasheet_id": args["datasheet_id"],
@@ -1313,14 +1481,12 @@ async def vika_records_query(args: Dict[str, Any], services: RuntimeServices) ->
 
 
 async def vika_records_read_all(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.records_read_all(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), args.get("page_size", 100), args.get("max_records"), args.get("max_pages"), args.get("sort"), args.get("field_key")))
+    return _raise_if_error(await _client(services).records_read_all(args["datasheet_id"], args.get("view_id"), args.get("formula"), args.get("fields"), args.get("page_size", 100), args.get("max_records"), args.get("max_pages"), args.get("sort"), args.get("field_key")))
 
 
 async def vika_export_records(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     result = _raise_if_error(
-        await _CLIENT.records_read_all(
+        await _client(services).records_read_all(
             args["datasheet_id"],
             args.get("view_id"),
             args.get("formula"),
@@ -1346,7 +1512,6 @@ async def vika_export_records(args: Dict[str, Any], services: RuntimeServices) -
 
 
 async def vika_records_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"datasheet_id": args["datasheet_id"], "records": args["records"], "field_key": args.get("field_key")}
     return services.write_plans.preview(
         "records.create",
@@ -1355,7 +1520,7 @@ async def vika_records_create(args: Dict[str, Any], services: RuntimeServices) -
         payload,
         _field_names_from_records(payload["records"]),
         _record_count_from_payload(payload),
-        lambda operation: _CLIENT.records_create(
+        lambda operation: _client(services).records_create(
             operation["payload"]["datasheet_id"],
             operation["payload"]["records"],
             operation["payload"].get("field_key"),
@@ -1364,7 +1529,6 @@ async def vika_records_create(args: Dict[str, Any], services: RuntimeServices) -
 
 
 async def vika_records_update(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"datasheet_id": args["datasheet_id"], "records": args["records"], "field_key": args.get("field_key")}
     return services.write_plans.preview(
         "records.update",
@@ -1373,7 +1537,7 @@ async def vika_records_update(args: Dict[str, Any], services: RuntimeServices) -
         payload,
         _field_names_from_records(payload["records"]),
         _record_count_from_payload(payload),
-        lambda operation: _CLIENT.records_update(
+        lambda operation: _client(services).records_update(
             operation["payload"]["datasheet_id"],
             operation["payload"]["records"],
             operation["payload"].get("field_key"),
@@ -1382,7 +1546,6 @@ async def vika_records_update(args: Dict[str, Any], services: RuntimeServices) -
 
 
 async def vika_records_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"datasheet_id": args["datasheet_id"], "record_ids": args["record_ids"]}
     return services.write_plans.preview(
         "records.delete",
@@ -1391,7 +1554,7 @@ async def vika_records_delete(args: Dict[str, Any], services: RuntimeServices) -
         payload,
         [],
         _record_count_from_payload(payload),
-        lambda operation: _CLIENT.records_delete(
+        lambda operation: _client(services).records_delete(
             operation["payload"]["datasheet_id"],
             operation["payload"]["record_ids"],
         ),
@@ -1408,17 +1571,14 @@ async def vika_write_commit(args: Dict[str, Any], services: RuntimeServices) -> 
 
 
 async def vika_records_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.records_get(args["datasheet_id"], args["record_ids"], args.get("fields"), args.get("field_key")))
+    return _raise_if_error(await _client(services).records_get(args["datasheet_id"], args["record_ids"], args.get("fields"), args.get("field_key")))
 
 
 async def vika_fields_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.fields_get(args["datasheet_id"], args["field_id_or_name"]))
+    return _raise_if_error(await _client(services).fields_get(args["datasheet_id"], args["field_id_or_name"]))
 
 
 async def vika_fields_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {
         "datasheet_id": args["datasheet_id"],
         "space_id": args["space_id"],
@@ -1433,7 +1593,7 @@ async def vika_fields_create(args: Dict[str, Any], services: RuntimeServices) ->
         payload,
         [payload["name"]],
         1,
-        lambda operation: _CLIENT.fields_create(
+        lambda operation: _client(services).fields_create(
             operation["payload"]["datasheet_id"],
             operation["payload"]["space_id"],
             operation["payload"]["name"],
@@ -1444,7 +1604,6 @@ async def vika_fields_create(args: Dict[str, Any], services: RuntimeServices) ->
 
 
 async def vika_fields_delete(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {
         "datasheet_id": args["datasheet_id"],
         "space_id": args["space_id"],
@@ -1457,7 +1616,7 @@ async def vika_fields_delete(args: Dict[str, Any], services: RuntimeServices) ->
         payload,
         [payload["field_id_or_name"]],
         1,
-        lambda operation: _CLIENT.fields_delete(
+        lambda operation: _client(services).fields_delete(
             operation["payload"]["datasheet_id"],
             operation["payload"]["space_id"],
             operation["payload"]["field_id_or_name"],
@@ -1466,13 +1625,14 @@ async def vika_fields_delete(args: Dict[str, Any], services: RuntimeServices) ->
 
 
 async def vika_views_get(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.views_get(args["datasheet_id"], args["view_id_or_name"]))
+    return _raise_if_error(await _client(services).views_get(args["datasheet_id"], args["view_id_or_name"]))
 
 
 async def vika_attachments_upload(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    payload = {"datasheet_id": args["datasheet_id"], "file_path": args["file_path"]}
+    file_facts = _attachment_upload_file_facts(args["file_path"])
+    if "error" in file_facts:
+        return file_facts
+    payload = {"datasheet_id": args["datasheet_id"], **file_facts}
     return services.write_plans.preview(
         "attachments.upload",
         args["datasheet_id"],
@@ -1480,20 +1640,24 @@ async def vika_attachments_upload(args: Dict[str, Any], services: RuntimeService
         payload,
         [],
         1,
-        lambda operation: _CLIENT.attachments_upload(
+        lambda operation: _attachment_upload_hash_guard(operation)
+        or _client(services).attachments_upload(
             operation["payload"]["datasheet_id"],
             operation["payload"]["file_path"],
+        ),
+        confirmation_details=file_facts,
+        confirmation_brief_suffix=(
+            f" 路径：{file_facts['file_path']}；文件：{file_facts['file_name']}，大小 {file_facts['file_size_bytes']} bytes，"
+            f"SHA-256 {file_facts['file_sha256']}。"
         ),
     )
 
 
 async def vika_attachments_download(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
-    return _raise_if_error(await _CLIENT.attachments_download(args["url"], None, args.get("save_path")))
+    return _raise_if_error(await _client(services).attachments_download(args["url"], services.artifact_store))
 
 
 async def vika_datasheets_create(args: Dict[str, Any], services: RuntimeServices) -> Any:
-    assert _CLIENT is not None
     payload = {"space_id": args["space_id"], **{key: args.get(key) for key in ("name", "description", "folder_id", "pre_filled_records") if key in args}}
     return services.write_plans.preview(
         "datasheets.create",
@@ -1502,7 +1666,7 @@ async def vika_datasheets_create(args: Dict[str, Any], services: RuntimeServices
         payload,
         [],
         1,
-        lambda operation: _CLIENT.datasheets_create(
+        lambda operation: _client(services).datasheets_create(
             operation["payload"]["space_id"],
             operation["payload"]["name"],
             operation["payload"].get("description"),
@@ -1538,6 +1702,8 @@ def _domain_for_tool(name: str) -> str:
         return "query"
     if ".records.read_all" in name or name == "vika_export_records":
         return "export"
+    if name == "vika.attachments.download":
+        return "export"
     return "admin"
 
 
@@ -1566,6 +1732,8 @@ def _capability_for_tool(name: str) -> Dict[str, Any]:
 def _result_policy_for_tool(name: str) -> Dict[str, Any]:
     if ".records.read_all" in name or name == "vika_export_records":
         return {"mode": "artifact", "default_format": "csv", "supported_formats": ["csv", "jsonl"]}
+    if name == "vika.attachments.download":
+        return {"mode": "artifact", "default_format": "binary", "supported_formats": ["binary"]}
     if ".records.query" in name:
         return {"mode": "inline", "default_page_size": 50, "max_page_size": 100, "max_chars": 20000}
     return {"mode": "inline", "max_chars": 20000}
@@ -1605,7 +1773,7 @@ def _example_value(name: str, schema: Optional[Dict[str, Any]]) -> Any:
     if name == "file_path":
         return "D:/AboutDEV/example.pdf"
     if name == "url":
-        return "https://example.com/file.pdf"
+        return "https://vika.cn/attachments/example.pdf"
     if name == "format":
         return "csv"
 
@@ -1688,9 +1856,11 @@ def _register(
     available: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     services: Optional[RuntimeServices] = None,
+    client: Optional[Any] = None,
 ) -> int:
-    assert _CLIENT is not None
     runtime_services = services or RuntimeServices()
+    current_client = client or runtime_services.vika_client
+    client_configured = bool(getattr(current_client, "configured", False))
     domain = _domain_for_tool(name)
     risk = _risk_for_tool(name)
     capability = _capability_for_tool(name)
@@ -1700,8 +1870,8 @@ def _register(
         input_schema=_schema(properties, required),
         output_schema=output_schema or {"type": "object", "additionalProperties": True},
         examples=_examples_for_tool(name, properties, required),
-        available=_CLIENT.configured if available is None else available,
-        unavailable_reason=None if (available is True or _CLIENT.configured) else "astral_vika not configured",
+        available=client_configured if available is None else available,
+        unavailable_reason=None if (available is True or client_configured) else "astral_vika not configured",
         tags=tags or ["vika"],
         domain=domain,
         risk=risk,
@@ -1729,19 +1899,30 @@ def _register(
     return 1
 
 
-def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeServices] = None) -> int:
-    global _CLIENT
-    cfg = load_config()
+def try_register_vika_tools(
+    registry: ToolRegistry,
+    services: Optional[RuntimeServices] = None,
+    config: Optional[Any] = None,
+    client: Optional[Any] = None,
+) -> int:
+    cfg = config or load_config()
     ttl_hours = getattr(cfg.cache, "ttl_hours", None) or getattr(cfg.vika, "cache_duration_hours", 24)
     cache = CatalogCache(db_path=cfg.cache.db_path, ttl_hours=ttl_hours, enabled=cfg.cache.enabled)
-    _CLIENT = VikaClient(
+    local_client = client or VikaClient(
         api_token=cfg.vika.api_token,
         host=cfg.vika.host,
         default_space_id=cfg.vika.default_space_id,
         workbench_space_id=getattr(cfg.vika, "workbench_space_id", None),
         cache=cache,
+        attachment_download_allowed_hosts=getattr(cfg.vika, "attachment_download_allowed_hosts", None),
     )
-    runtime_services = services or RuntimeServices()
+    base_services = services or RuntimeServices()
+    base_services.vika_client = local_client
+    runtime_services = RuntimeServices(
+        artifact_store=base_services.artifact_store,
+        write_plans=base_services.write_plans,
+        vika_client=local_client,
+    )
 
     def register(
         name: str,
@@ -1764,6 +1945,7 @@ def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeSe
             available,
             output_schema,
             services=runtime_services,
+            client=local_client,
         )
 
     registered = 0
@@ -1848,9 +2030,9 @@ def try_register_vika_tools(registry: ToolRegistry, services: Optional[RuntimeSe
     registered += register("vika.attachments.upload", "上传附件 preview，不直接执行；执行必须走 vika.write.commit。", vika_attachments_upload, _with_safety({"datasheet_id": str_prop, "file_path": str_prop}), ["datasheet_id", "file_path"], ["vika", "attachments"])
     registered += register(
         "vika.attachments.download",
-        "按附件 URL 下载附件到本地。",
+        "按 allowlist 附件 URL 下载到服务端 artifact；不接受 save_path，不直接写任意本机路径。",
         vika_attachments_download,
-        {"url": str_prop, "save_path": str_prop},
+        {"url": str_prop},
         ["url"],
         ["vika", "attachments"],
     )

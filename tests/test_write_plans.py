@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -187,38 +189,35 @@ async def test_vika_write_tool_uses_preview_commit_boundary() -> None:
     from vika_mcp.tools import vika_tools
 
     class FakeClient:
+        configured = True
+
         async def records_create(self, datasheet_id, records, field_key=None):
             return {"datasheet_id": datasheet_id, "created": len(records), "field_key": field_key}
 
-    old_client = vika_tools._CLIENT
-    services = RuntimeServices()
-    vika_tools._CLIENT = FakeClient()
-    try:
-        preview = await vika_tools.vika_records_create(
-            {
-                "datasheet_id": "dst123",
-                "records": [{"fields": {"客户名": "Alice", "来源": "官网"}}],
-            },
-            services,
-        )
-        assert preview["preview_only"] is True
-        assert preview["operation_type"] == "records.create"
-        assert "operation_id" in preview
-        assert "confirmation_summary" not in preview
+    services = RuntimeServices(vika_client=FakeClient())
+    preview = await vika_tools.vika_records_create(
+        {
+            "datasheet_id": "dst123",
+            "records": [{"fields": {"客户名": "Alice", "来源": "官网"}}],
+        },
+        services,
+    )
+    assert preview["preview_only"] is True
+    assert preview["operation_type"] == "records.create"
+    assert "operation_id" in preview
+    assert "confirmation_summary" not in preview
 
-        committed = await vika_tools.vika_write_commit(
-            {
-                "operation_id": preview["operation_id"],
-                "confirmed_payload_hash": preview["payload_hash"],
-                "confirmed_by_user": True,
-                "user_confirmation_summary": "用户确认向目标表新增 1 条记录。",
-            },
-            services,
-        )
-        assert committed["committed"] is True
-        assert committed["result"]["created"] == 1
-    finally:
-        vika_tools._CLIENT = old_client
+    committed = await vika_tools.vika_write_commit(
+        {
+            "operation_id": preview["operation_id"],
+            "confirmed_payload_hash": preview["payload_hash"],
+            "confirmed_by_user": True,
+            "user_confirmation_summary": "用户确认向目标表新增 1 条记录。",
+        },
+        services,
+    )
+    assert committed["committed"] is True
+    assert committed["result"]["created"] == 1
 
 
 @pytest.mark.anyio
@@ -307,37 +306,97 @@ async def test_vika_write_tool_commit_uses_preview_payload_after_args_mutation()
     from vika_mcp.tools import vika_tools
 
     class FakeClient:
+        configured = True
+
         async def records_create(self, datasheet_id, records, field_key=None):
             return {"datasheet_id": datasheet_id, "records": records, "field_key": field_key}
 
-    old_client = vika_tools._CLIENT
-    services = RuntimeServices()
-    vika_tools._CLIENT = FakeClient()
+    services = RuntimeServices(vika_client=FakeClient())
     args = {
         "datasheet_id": "dstOriginal",
         "records": [{"fields": {"客户名": "Alice"}}],
         "field_key": "name",
     }
-    try:
-        preview = await vika_tools.vika_records_create(args, services)
-        args["datasheet_id"] = "dstMutated"
-        args["records"][0]["fields"]["客户名"] = "Bob"
-        args["field_key"] = "id"
+    preview = await vika_tools.vika_records_create(args, services)
+    args["datasheet_id"] = "dstMutated"
+    args["records"][0]["fields"]["客户名"] = "Bob"
+    args["field_key"] = "id"
 
-        committed = await vika_tools.vika_write_commit(
-            {
-                "operation_id": preview["operation_id"],
-                "confirmed_payload_hash": preview["payload_hash"],
-                "confirmed_by_user": True,
-            },
-            services,
-        )
+    committed = await vika_tools.vika_write_commit(
+        {
+            "operation_id": preview["operation_id"],
+            "confirmed_payload_hash": preview["payload_hash"],
+            "confirmed_by_user": True,
+        },
+        services,
+    )
 
-        assert committed["result"]["datasheet_id"] == "dstOriginal"
-        assert committed["result"]["records"][0]["fields"]["客户名"] == "Alice"
-        assert committed["result"]["field_key"] == "name"
-    finally:
-        vika_tools._CLIENT = old_client
+    assert committed["result"]["datasheet_id"] == "dstOriginal"
+    assert committed["result"]["records"][0]["fields"]["客户名"] == "Alice"
+    assert committed["result"]["field_key"] == "name"
+
+
+@pytest.mark.anyio
+async def test_attachment_upload_preview_discloses_file_facts_without_path_restriction(tmp_path: Path) -> None:
+    from vika_mcp.runtime.services import RuntimeServices
+    from vika_mcp.tools import vika_tools
+
+    class FakeClient:
+        configured = True
+
+        async def attachments_upload(self, datasheet_id, file_path):
+            return {"datasheet_id": datasheet_id, "file_path": file_path}
+
+    local_file = tmp_path / "outside-artifact-root.txt"
+    local_file.write_text("upload me", encoding="utf-8")
+    services = RuntimeServices(vika_client=FakeClient())
+
+    preview = await vika_tools.vika_attachments_upload(
+        {"datasheet_id": "dst123", "file_path": str(local_file)},
+        services,
+    )
+
+    expected_hash = hashlib.sha256(local_file.read_bytes()).hexdigest()
+    context = preview["confirmation_context"]
+    assert context["file_path"] == str(local_file.resolve())
+    assert context["file_name"] == "outside-artifact-root.txt"
+    assert context["file_size_bytes"] == len("upload me")
+    assert context["file_sha256"] == expected_hash
+    assert preview["preview_only"] is True
+    assert "outside-artifact-root.txt" in preview["confirmation_brief"]
+
+
+@pytest.mark.anyio
+async def test_attachment_upload_commit_rejects_changed_file_after_preview(tmp_path: Path) -> None:
+    from vika_mcp.runtime.services import RuntimeServices
+    from vika_mcp.tools import vika_tools
+
+    class FakeClient:
+        configured = True
+
+        async def attachments_upload(self, datasheet_id, file_path):
+            return {"datasheet_id": datasheet_id, "file_path": file_path}
+
+    local_file = tmp_path / "mutable.txt"
+    local_file.write_text("before", encoding="utf-8")
+    services = RuntimeServices(vika_client=FakeClient())
+
+    preview = await vika_tools.vika_attachments_upload(
+        {"datasheet_id": "dst123", "file_path": str(local_file)},
+        services,
+    )
+    local_file.write_text("after", encoding="utf-8")
+    committed = await vika_tools.vika_write_commit(
+        {
+            "operation_id": preview["operation_id"],
+            "confirmed_payload_hash": preview["payload_hash"],
+            "confirmed_by_user": True,
+        },
+        services,
+    )
+
+    assert committed["committed"] is False
+    assert committed["error"]["code"] == "file_hash_mismatch"
 
 
 def test_vika_write_commit_schema_uses_payload_hash_without_user_summary_match() -> None:
@@ -358,7 +417,6 @@ def test_vika_write_commit_schema_uses_payload_hash_without_user_summary_match()
 async def test_runtime_services_isolate_write_plan_stores() -> None:
     from vika_mcp.runtime.build_registry import build_hidden_registry
     from vika_mcp.runtime.services import RuntimeServices
-    from vika_mcp.tools import vika_tools
 
     class FakeClient:
         configured = True
@@ -366,25 +424,20 @@ async def test_runtime_services_isolate_write_plan_stores() -> None:
         async def records_create(self, datasheet_id, records, field_key=None):
             return {"datasheet_id": datasheet_id, "created": len(records)}
 
-    old_client = vika_tools._CLIENT
-    vika_tools._CLIENT = FakeClient()
-    try:
-        services_a = RuntimeServices()
-        services_b = RuntimeServices()
-        registry_a = build_hidden_registry(services=services_a)
-        registry_b = build_hidden_registry(services=services_b)
+    services_a = RuntimeServices()
+    services_b = RuntimeServices()
+    registry_a = build_hidden_registry(services=services_a, vika_client=FakeClient())
+    registry_b = build_hidden_registry(services=services_b, vika_client=FakeClient())
 
-        _spec_a, create_a = registry_a.get("vika.records.create")
-        _spec_b, commit_b = registry_b.get("vika.write.commit")
-        preview = await create_a({"datasheet_id": "dst123", "records": [{"fields": {"name": "Alice"}}]})
-        rejected = await commit_b(
-            {
-                "operation_id": preview["operation_id"],
-                "confirmed_payload_hash": preview["payload_hash"],
-                "confirmed_by_user": True,
-            }
-        )
+    _spec_a, create_a = registry_a.get("vika.records.create")
+    _spec_b, commit_b = registry_b.get("vika.write.commit")
+    preview = await create_a({"datasheet_id": "dst123", "records": [{"fields": {"name": "Alice"}}]})
+    rejected = await commit_b(
+        {
+            "operation_id": preview["operation_id"],
+            "confirmed_payload_hash": preview["payload_hash"],
+            "confirmed_by_user": True,
+        }
+    )
 
-        assert rejected["error"]["code"] == "operation_not_found"
-    finally:
-        vika_tools._CLIENT = old_client
+    assert rejected["error"]["code"] == "operation_not_found"

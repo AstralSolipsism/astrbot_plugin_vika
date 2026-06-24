@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,8 @@ ARTIFACT_READ_DEFAULT_LINES = 100
 ARTIFACT_READ_MAX_LINES = 500
 ARTIFACT_READ_MAX_CHARS = 40_000
 ARTIFACT_SUPPORTED_FORMATS = {"csv", "jsonl"}
+ARTIFACT_BINARY_FORMAT = "binary"
+DOWNLOAD_FILENAME_MAX_CHARS = 180
 
 
 class ArtifactStore:
@@ -81,6 +84,74 @@ class ArtifactStore:
             "content_inline": False,
             "next_actions": ["vika_artifact_head", "vika_artifact_search", "vika_artifact_read"],
         }
+
+    def prepare_download_artifact(
+        self,
+        filename: Optional[str],
+        source_url: str,
+        content_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        artifact_id = f"dl_{uuid.uuid4().hex}"
+        path = self._binary_data_path(artifact_id)
+        manifest_path = self._manifest_path(artifact_id)
+        return {
+            "artifact_id": artifact_id,
+            "path": str(path),
+            "manifest_path": str(manifest_path),
+            "filename": self._safe_download_filename(filename),
+            "source_url_hash": hashlib.sha256((source_url or "").encode("utf-8")).hexdigest(),
+            "content_type": content_type or "application/octet-stream",
+        }
+
+    def finish_download_artifact(
+        self,
+        prepared: Dict[str, Any],
+        byte_count: int,
+        content_type: Optional[str] = None,
+        filename: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        artifact_id = str(prepared["artifact_id"])
+        path = Path(prepared["path"]).resolve()
+        manifest_path = Path(prepared["manifest_path"]).resolve()
+        self._ensure_inside_root(path)
+        self._ensure_inside_root(manifest_path)
+        if not path.is_file():
+            raise ValueError(f"artifact not found: {artifact_id}")
+
+        manifest = {
+            "artifact_id": artifact_id,
+            "filename": self._safe_download_filename(filename or prepared.get("filename")),
+            "format": ARTIFACT_BINARY_FORMAT,
+            "content_type": content_type or prepared.get("content_type") or "application/octet-stream",
+            "byte_count": int(byte_count),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_url_hash": prepared["source_url_hash"],
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            **manifest,
+            "path": str(path),
+            "manifest_path": str(manifest_path),
+            "content_inline": False,
+            "next_actions": ["vika_artifact_status"],
+        }
+
+    def create_download_artifact(
+        self,
+        filename: Optional[str],
+        source_url: str,
+        content_type: Optional[str],
+        content: bytes,
+    ) -> Dict[str, Any]:
+        prepared = self.prepare_download_artifact(filename=filename, source_url=source_url, content_type=content_type)
+        path = Path(prepared["path"])
+        path.write_bytes(content)
+        return self.finish_download_artifact(
+            prepared,
+            byte_count=len(content),
+            content_type=content_type,
+            filename=filename,
+        )
 
     def head(self, artifact_id: str, lines: int = ARTIFACT_HEAD_DEFAULT_LINES) -> Dict[str, Any]:
         line_limit = min(max(int(lines or ARTIFACT_HEAD_DEFAULT_LINES), 1), ARTIFACT_HEAD_MAX_LINES)
@@ -160,6 +231,12 @@ class ArtifactStore:
         self._ensure_inside_root(path)
         return path
 
+    def _binary_data_path(self, artifact_id: str) -> Path:
+        self._validate_artifact_id(artifact_id)
+        path = (self.root / f"{artifact_id}.bin").resolve()
+        self._ensure_inside_root(path)
+        return path
+
     def _manifest_path(self, artifact_id: str) -> Path:
         self._validate_artifact_id(artifact_id)
         path = (self.root / f"{artifact_id}.manifest.json").resolve()
@@ -169,6 +246,8 @@ class ArtifactStore:
     def _existing_data_path(self, artifact_id: str) -> Path:
         manifest = self.status(artifact_id)
         fmt = manifest.get("format") or "csv"
+        if fmt == ARTIFACT_BINARY_FORMAT:
+            raise ValueError(f"artifact format is not line-readable: {fmt}")
         path = self._data_path(artifact_id, fmt)
         if not path.is_file():
             raise ValueError(f"artifact not found: {artifact_id}")
@@ -187,3 +266,13 @@ class ArtifactStore:
     def _validate_artifact_id(self, artifact_id: str) -> None:
         if not artifact_id or not all(ch.isalnum() or ch in {"_", "-"} for ch in artifact_id):
             raise ValueError(f"invalid artifact id: {artifact_id}")
+
+    def _safe_download_filename(self, filename: Optional[str]) -> str:
+        base = Path(filename or "download.bin").name.strip()
+        base = re.sub(r"[\x00-\x1f<>:\"/\\|?*]+", "_", base)
+        base = base.strip(" .") or "download.bin"
+        if len(base) > DOWNLOAD_FILENAME_MAX_CHARS:
+            stem = Path(base).stem[:120].rstrip(" .") or "download"
+            suffix = Path(base).suffix[:20]
+            base = f"{stem}{suffix}"
+        return base
