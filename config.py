@@ -6,7 +6,7 @@ try:
 except Exception:
     yaml = None  # type: ignore
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ServerConfig(BaseModel):
@@ -18,8 +18,7 @@ class ServerConfig(BaseModel):
 class RegistryConfig(BaseModel):
     enable_builtin: bool = True
     enable_vika_tools: bool = True
-    auto_discover: bool = True
-    enabled_toolsets: List[str] = []
+    enabled_toolsets: List[str] = Field(default_factory=list)
 
 
 class CacheConfig(BaseModel):
@@ -35,16 +34,17 @@ class VikaConfig(BaseModel):
     workbench_url: Optional[str] = None
     workbench_space_id: Optional[str] = None
     cache_duration_hours: int = 24
+    attachment_download_allowed_hosts: List[str] = Field(default_factory=list)
 
 
 
 
 class AppConfig(BaseModel):
     version: str = "v1"
-    server: ServerConfig = ServerConfig()
-    registry: RegistryConfig = RegistryConfig()
-    cache: CacheConfig = CacheConfig()
-    vika: VikaConfig = VikaConfig()
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    registry: RegistryConfig = Field(default_factory=RegistryConfig)
+    cache: CacheConfig = Field(default_factory=CacheConfig)
+    vika: VikaConfig = Field(default_factory=VikaConfig)
 
 
 def _deep_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,20 +69,25 @@ def _set_nested(d: Dict[str, Any], keys: List[str], value: Any) -> None:
     cur[keys[-1]] = value
 
 
-def _load_yaml_file(path: str) -> Dict[str, Any]:
+def _load_yaml_file(path: str, *, required: bool = False) -> Dict[str, Any]:
     if not path:
         return {}
-    try:
-        if os.path.exists(path) and os.path.isfile(path):
-            if yaml is not None:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                    if isinstance(data, dict):
-                        return data
-            return {}
-    except Exception:
+    if not os.path.exists(path) or not os.path.isfile(path):
+        if required:
+            raise ValueError(f"Config file not found: {path}")
         return {}
-    return {}
+    if yaml is None:
+        raise ValueError("PyYAML is required to load config files.")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except Exception as exc:
+        raise ValueError(f"Failed to parse config file {path}: {exc}") from exc
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file {path} must contain a YAML mapping at the top level.")
+    return data
 
 
 def _collect_env_overrides() -> Dict[str, Any]:
@@ -95,6 +100,7 @@ def _collect_env_overrides() -> Dict[str, Any]:
 
     list_fields = {
         "registry.enabled_toolsets",
+        "vika.attachment_download_allowed_hosts",
     }
 
     for raw_key, raw_value in os.environ.items():
@@ -123,11 +129,15 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     合并优先级：环境变量 > YAML 文件 > 默认值
     - YAML 路径优先级：参数 config_path > 环境变量 VIKAMCP_CONFIG > 默认 vika_mcp.yaml（若存在）
     """
-    yaml_path = config_path or os.getenv("VIKAMCP_CONFIG") or "vika_mcp.yaml"
+    env_config_path = os.getenv("VIKAMCP_CONFIG")
+    explicit_path = config_path or env_config_path
+    yaml_path = explicit_path or "vika_mcp.yaml"
 
     yaml_data: Dict[str, Any] = {}
-    if yaml_path and os.path.exists(yaml_path):
-        yaml_data = _load_yaml_file(yaml_path) or {}
+    if explicit_path:
+        yaml_data = _load_yaml_file(yaml_path, required=True) or {}
+    elif yaml_path and os.path.exists(yaml_path):
+        yaml_data = _load_yaml_file(yaml_path, required=True) or {}
 
     env_overrides = _collect_env_overrides()
 
