@@ -31,6 +31,7 @@ def test_requirements_do_not_depend_on_external_astral_vika_distribution() -> No
 
     assert not any(line.startswith("astral-vika") or line.startswith("astral_vika") for line in normalized)
     assert not any("astral_vika" in line or "astral-vika" in line for line in normalized)
+    assert "aiohttp>=3.8.0,<4.0.0" in normalized
 
 
 def test_project_metadata_vendors_astral_vika_runtime_package() -> None:
@@ -42,6 +43,7 @@ def test_project_metadata_vendors_astral_vika_runtime_package() -> None:
     dependencies = {dependency.lower() for dependency in metadata["project"]["dependencies"]}
     assert not any(dependency.startswith("astral-vika") or dependency.startswith("astral_vika") for dependency in dependencies)
     assert "mcp==1.12.4" in dependencies
+    assert "aiohttp>=3.8.0,<4.0.0" in dependencies
 
     packages = set(metadata["tool"]["setuptools"]["packages"])
     assert {"vika_mcp", "vika_mcp.runtime", "vika_mcp.tools"}.issubset(packages)
@@ -79,7 +81,8 @@ def test_vika_mcp_source_checkout_bootstraps_vendored_astral_vika() -> None:
                 "import vika_mcp; "
                 "from vika_mcp.tools import vika_tools as vt; "
                 "import astral_vika; "
-                "print(f'imported={vt._VIKA_IMPORTED};version={astral_vika.__version__};file={astral_vika.__file__}')"
+                "from astral_vika.datasheet.attachment_manager import AttachmentManager; "
+                "print(f'imported={vt._VIKA_IMPORTED};version={astral_vika.__version__};attachment={AttachmentManager.__name__};file={astral_vika.__file__}')"
             ),
         ],
         cwd=ROOT.parent,
@@ -90,7 +93,7 @@ def test_vika_mcp_source_checkout_bootstraps_vendored_astral_vika() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "imported=True;version=1.1.3" in result.stdout
+    assert "imported=True;version=1.1.3;attachment=AttachmentManager" in result.stdout
     assert "vendor" in result.stdout.replace("\\", "/")
 
 
