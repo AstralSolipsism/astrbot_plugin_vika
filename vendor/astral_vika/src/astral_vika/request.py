@@ -2,17 +2,73 @@
 维格表HTTP请求处理模块
 
 兼容原vika.py库的请求处理方式
+
+Transport note: this module prefers ``curl_cffi`` when available so that the
+TLS ClientHello (JA3/JA4) and HTTP/2 settings/priority frames match a real
+Chrome browser, and the default request headers are sent in Chrome's order.
+This keeps the SDK's network fingerprint identical to the Vika web client,
+which is what the deployment's risk-control layer expects. When
+``curl_cffi`` is not installed, it transparently falls back to ``httpx``.
 """
 import asyncio
-import httpx
 import json
+import os
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+import httpx
 
 from .const import DEFAULT_API_BASE, FUSION_API_PREFIX
 from .exceptions import VikaException, create_exception_from_response
 from .utils import build_api_url, handle_response
 
 QueryParams = Union[Dict[str, Any], Iterable[Tuple[str, Any]]]
+
+try:  # pragma: no cover - import guard for the optional browser-impersonation backend
+    from curl_cffi.requests import AsyncSession as _CurlAsyncSession  # type: ignore
+
+    _HAS_CURL_CFFI = True
+except Exception:  # pragma: no cover
+    _CurlAsyncSession = None  # type: ignore
+    _HAS_CURL_CFFI = False
+
+# Chrome/BoringSSL impersonation target. curl_cffi 0.15 ships up to chrome146;
+# pick the closest available to the real Chrome 149 the web client runs.
+_IMPERSONATE_TARGET = os.getenv("VIKA_IMPERSONATE", "chrome146")
+
+# Real Chrome 149 / Windows headers (captured from the live web client) for a
+# same-origin XHR to the Vika API. Order matters: Chrome emits client-hints,
+# then User-Agent, then fetch-metadata, then content negotiation headers.
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+
+def _browser_headers(referer: Optional[str]) -> Dict[str, str]:
+    """Build the Chrome/Windows XHR header set in Chrome's emission order.
+
+    Args:
+        referer: Origin/referer URL for the request, or ``None`` to omit.
+
+    Returns:
+        Ordered dict of browser-matching headers (excluding Authorization,
+        which is injected per-request by the session).
+    """
+    headers: Dict[str, str] = {
+        "sec-ch-ua-platform": '"Windows"',
+        "User-Agent": _CHROME_UA,
+        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "Accept": "application/json, text/plain, */*",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
 
 
 def _serialize_params(params: Optional[QueryParams]) -> List[Tuple[str, Any]]:
@@ -55,7 +111,12 @@ def _serialize_params(params: Optional[QueryParams]) -> List[Tuple[str, Any]]:
 
 class Session:
     """
-    一个原生异步的HTTP请求会话，使用httpx库。
+    一个原生异步的HTTP请求会话。
+
+    When ``curl_cffi`` is available the session impersonates Chrome at the TLS
+    (JA3/JA4) and HTTP/2 layers and sends the browser's default header set in
+    Chrome order, so the wire fingerprint is indistinguishable from the Vika
+    web client. It falls back to a plain ``httpx.AsyncClient`` otherwise.
     """
 
     def __init__(self, token: str, api_base: str = DEFAULT_API_BASE, status_callback: Optional[Callable[[str], Awaitable[None]]] = None):
@@ -65,13 +126,47 @@ class Session:
         self.status_callback = status_callback
         self.rate_limit_retries = 3
         self.rate_limit_base_delay = 0.6
-        headers = {
-            # 仅用于请求头注入，不在属性/日志中明文暴露
-            'Authorization': f'Bearer {self._token}',
-            'Content-Type': 'application/json',
-            'User-Agent': 'vika-py/2.0.0'
-        }
-        self.client = httpx.AsyncClient(headers=headers, timeout=30.0)
+        # Authoritative header set + order is assembled per-request so the
+        # bearer token and referer are placed exactly where Chrome puts them.
+        self._auth_header = f'Bearer {self._token}'
+        # Whether the TLS/HTTP2 fingerprint is browser-impersonated.
+        self._impersonated = _HAS_CURL_CFFI
+        # Allow self-signed/private-CA deployments (e.g. :7886) to be reachable
+        # without forcing every caller to pass verify=False explicitly.
+        self._verify = os.getenv("VIKA_VERIFY_TLS", "1") not in ("0", "false", "False")
+        if self._impersonated:
+            # default_headers=False: we provide the full Chrome header set
+            # ourselves below; only borrow curl_cffi's TLS + H2 fingerprint.
+            self.client = _CurlAsyncSession(
+                impersonate=_IMPERSONATE_TARGET,
+                default_headers=False,
+                timeout=30.0,
+                verify=self._verify,
+            )
+        else:
+            headers = {
+                'Authorization': self._auth_header,
+                'Content-Type': 'application/json',
+                'User-Agent': 'vika-py/2.0.0',
+            }
+            self.client = httpx.AsyncClient(headers=headers, timeout=30.0, verify=self._verify)
+
+    def _default_headers(self, extra: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """Compose the request header set for the impersonated transport.
+
+        Args:
+            extra: Per-call headers (e.g. ``X-Front-Version``) to merge in.
+
+        Returns:
+            Headers including Authorization, browser defaults, and any extras.
+        """
+        headers = _browser_headers(referer=f"{self.api_base}/")
+        # Authorization sits with the content-negotiation group, matching the
+        # axios client used by the Vika web app.
+        headers['Authorization'] = self._auth_header
+        if extra:
+            headers.update(extra)
+        return headers
 
     def _build_url(self, endpoint: str) -> str:
         """构建完整URL"""
@@ -102,6 +197,15 @@ class Session:
         url = self._build_url(endpoint)
         final_params = _serialize_params(params)
 
+        # Compose headers. For the impersonated transport we rebuild the full
+        # Chrome header set per call (curl_cffi was created with
+        # default_headers=False). For the httpx fallback the client already
+        # carries Authorization/Content-Type/User-Agent, so only extras apply.
+        if self._impersonated:
+            request_headers = self._default_headers(headers)
+        else:
+            request_headers = headers  # httpx client defaults already set
+
         for attempt in range(self.rate_limit_retries + 1):
             try:
                 if self.status_callback:
@@ -113,12 +217,12 @@ class Session:
                     json=json_body,
                     data=data,
                     files=files,
-                    headers=headers,  # 允许覆盖默认头
+                    headers=request_headers,  # 允许覆盖默认头
                 )
 
                 try:
                     response_data = response.json()
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     # 解析失败时抛异常以统一错误语义并避免返回临时结构
                     raw_text = response.text or ""
                     snippet = raw_text[:128]
@@ -136,10 +240,16 @@ class Session:
 
             except httpx.RequestError as e:
                 raise VikaException(f"Network error: {str(e)}") from e
+            except Exception as e:
+                # curl_cffi raises its own CurlError; normalize to VikaException
+                # so callers always see a single error type on transport failure.
+                if self._impersonated and not isinstance(e, VikaException):
+                    raise VikaException(f"Network error: {str(e)}") from e
+                raise
 
         raise VikaException("Request retry loop exited unexpectedly")
 
-    def _rate_limit_delay(self, response: httpx.Response, attempt: int) -> float:
+    def _rate_limit_delay(self, response: Any, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After")
         if retry_after:
             try:
@@ -179,7 +289,11 @@ class Session:
 
     async def close(self) -> None:
         """关闭客户端会话"""
-        await self.client.aclose()
+        # curl_cffi uses ``close()``; httpx uses ``aclose()``.
+        if self._impersonated:
+            await self.client.close()
+        else:
+            await self.client.aclose()
 
     async def __aenter__(self) -> 'Session':
         return self
