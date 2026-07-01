@@ -9,10 +9,16 @@ except Exception:
 from pydantic import BaseModel, Field
 
 
+class RateLimitConfig(BaseModel):
+    enabled: bool = True
+    qps: float = 5.0
+
+
 class ServerConfig(BaseModel):
     host: str = "localhost"
     port: int = 8080
     log_level: str = "INFO"
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
 
 
 class RegistryConfig(BaseModel):
@@ -162,6 +168,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
 __all__ = [
     "ServerConfig",
+    "RateLimitConfig",
     "RegistryConfig",
     "CacheConfig",
     "VikaConfig",

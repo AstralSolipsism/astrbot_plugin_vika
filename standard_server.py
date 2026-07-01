@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 import os
+from types import MethodType
 from typing import Any, Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -11,6 +10,7 @@ from .config import load_config
 from .runtime.auth import StaticBearerTokenVerifier
 from .runtime.build_registry import build_hidden_registry
 from .runtime.meta_tools import MetaToolRuntime, visible_meta_tool_definitions
+from .runtime.rate_limiter import AsyncTokenBucketRateLimiter, NoOpRateLimiter
 from .runtime.services import RuntimeServices
 from .runtime.types import ToolDefinition
 
@@ -42,6 +42,13 @@ def create_standard_mcp(
     effective_host = host or config.server.host or "127.0.0.1"
     effective_port = port or config.server.port or 8080
     auth_settings, token_verifier = _transport_auth(effective_host, effective_port, transport)
+    rate_limit_cfg = config.server.rate_limit
+    limiter: AsyncTokenBucketRateLimiter | NoOpRateLimiter
+    if rate_limit_cfg.enabled and rate_limit_cfg.qps > 0:
+        limiter = AsyncTokenBucketRateLimiter(qps=rate_limit_cfg.qps)
+    else:
+        limiter = NoOpRateLimiter()
+
     server = FastMCP(
         "vika_mcp",
         instructions=(
@@ -66,7 +73,37 @@ def create_standard_mcp(
         token_verifier=token_verifier,
     )
     register_meta_tools(server, runtime)
+    _wrap_tools_with_rate_limit(server, limiter)
     return server
+
+
+def _wrap_tools_with_rate_limit(
+    server: FastMCP,
+    limiter: AsyncTokenBucketRateLimiter | NoOpRateLimiter,
+) -> None:
+    """为所有已注册到 FastMCP 的工具包装 run 方法，实现全局令牌桶限速。
+
+    由于 FastMCP 在 __init__ 中已将 self.call_tool 作为 handler 注册到内部
+    _mcp_server，直接替换 FastMCP.call_tool 不会生效。这里在每个 Tool 的
+    run 方法上加限速，确保所有 MCP 工具调用路径都经过令牌桶。
+    """
+    for tool in server._tool_manager._tools.values():
+        original_run = tool.run
+
+        async def _rate_limited_run(
+            self: Any,
+            arguments: dict[str, Any],
+            context: Any = None,
+            convert_result: bool = False,
+            *,
+            _original_run: Any = original_run,
+            _limiter: AsyncTokenBucketRateLimiter | NoOpRateLimiter = limiter,
+        ) -> Any:
+            await _limiter.acquire(1.0)
+            return await _original_run(arguments, context=context, convert_result=convert_result)
+
+        # Tool 是 Pydantic 模型，需通过 MethodType 替换实例方法绑定。
+        object.__setattr__(tool, "run", MethodType(_rate_limited_run, tool))
 
 
 def _transport_auth(host: str, port: int, transport: str) -> tuple[AuthSettings | None, StaticBearerTokenVerifier | None]:

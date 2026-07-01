@@ -63,6 +63,32 @@ YAML file, startup fails. If no explicit path is provided and the default
 `vika_mcp.yaml` file is absent, the service starts from defaults plus
 environment overrides.
 
+### Global rate limiting
+
+The server applies a global token-bucket rate limit to all MCP tool calls by
+default, with a default QPS of `5`. This prevents overly frequent requests from
+causing backend or local resource issues. The bucket capacity equals the QPS,
+allowing a short burst up to the configured QPS.
+
+Configure via environment variables:
+
+```powershell
+# Adjust QPS (must be positive)
+$env:VIKAMCP_SERVER__RATE_LIMIT__QPS="10"
+
+# Disable rate limiting entirely
+$env:VIKAMCP_SERVER__RATE_LIMIT__ENABLED="false"
+```
+
+Or via YAML config:
+
+```yaml
+server:
+  rate_limit:
+    enabled: true
+    qps: 5
+```
+
 Registry switches are honored at startup:
 
 - `registry.enable_vika_tools=false` skips Vika tool registration.
