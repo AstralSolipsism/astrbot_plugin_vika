@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vika-mcp"
+version = "0.1.0"
+description = "Universal MCP-style Vika service backed by the astral_vika SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.8.0,<4.0.0",
+    "anyio>=4.5.0",
+    "httpx>=0.27.1",
+    "mcp==1.12.4",
+    "pydantic>=2.11.0,<3.0.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+vika-mcp = "vika_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/AstralSolipsism/astrbot_plugin_vika"
+Repository = "https://github.com/AstralSolipsism/astrbot_plugin_vika"
+Issues = "https://github.com/AstralSolipsism/astrbot_plugin_vika/issues"
+
+[tool.setuptools]
+packages = [
+    "vika_mcp",
+    "vika_mcp.runtime",
+    "vika_mcp.tools",
+    "astral_vika",
+    "astral_vika.datasheet",
+    "astral_vika.node",
+    "astral_vika.space",
+    "astral_vika.types",
+    "astral_vika.unit",
+]
+
+[tool.setuptools.package-dir]
+"vika_mcp" = "."
+"astral_vika" = "vendor/astral_vika/src/astral_vika"
